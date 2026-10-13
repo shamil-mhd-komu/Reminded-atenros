@@ -1,0 +1,45 @@
+[
+  {
+    "id": "macro-extend-interval",
+    "name": "Auto Add Timer (+1 Keepalive)",
+    "description": "When enabled, it will automatically click +1 when timer reaches below 1:00.",
+    "type": "extend_interval",
+    "enabled": false,
+    "lastRunTimestamp": null,
+    "nextRunTimestamp": null,
+    "runCount": 0
+  },
+  {
+    "id": "macro-afk-watchdog",
+    "name": "24/7 AFK Watchdog",
+    "description": "Automatically detects if the server is offline or crashed and restarts it to maintain 24/7 continuous uptime",
+    "type": "afk_watchdog",
+    "enabled": false,
+    "intervalMinutes": 1,
+    "lastRunTimestamp": null,
+    "nextRunTimestamp": null,
+    "runCount": 0
+  },
+  {
+    "id": "macro-restart-interval",
+    "name": "Interval Server Restart",
+    "description": "Automatically restart the server every X hours or minutes to prevent lag and refresh server state",
+    "type": "restart_interval",
+    "enabled": false,
+    "intervalMinutes": 60,
+    "lastRunTimestamp": null,
+    "nextRunTimestamp": null,
+    "runCount": 0
+  },
+  {
+    "id": "macro-restart-daily",
+    "name": "Daily Scheduled Restart",
+    "description": "Automatically restart the server everyday at a scheduled time (e.g. 06:30 AM)",
+    "type": "restart_daily",
+    "enabled": false,
+    "dailyTime": "06:30",
+    "lastRunTimestamp": null,
+    "nextRunTimestamp": null,
+    "runCount": 0
+  }
+]

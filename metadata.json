@@ -1,0 +1,8 @@
+{
+  "name": "Remix Aternos-Ui",
+  "description": "Imported from GitHub: shamil-mhd-komu/Aternos-Ui",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
