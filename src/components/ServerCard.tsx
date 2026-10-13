@@ -148,6 +148,29 @@ export const ServerCard: React.FC<ServerCardProps> = ({
             )}
           </div>
 
+          {/* Connected player heads with border */}
+          {state.status === 'online' && state.playerList && state.playerList.length > 0 && (
+            <div className="flex items-center gap-2 pt-0.5">
+              <span className="text-xs font-mono text-zinc-400">Online:</span>
+              <div className="flex items-center -space-x-1.5">
+                {state.playerList.slice(0, 10).map((player) => (
+                  <div key={player} className="relative group" title={player}>
+                    <img
+                      src={`https://mc-heads.net/avatar/${encodeURIComponent(player)}/32`}
+                      alt={player}
+                      className="w-6 h-6 rounded-md border-2 border-zinc-900 ring-2 ring-emerald-400/80 shadow-md object-cover bg-zinc-800"
+                    />
+                  </div>
+                ))}
+                {state.playerList.length > 10 && (
+                  <span className="pl-2 text-xs font-mono text-zinc-400">
+                    +{state.playerList.length - 10}
+                  </span>
+                )}
+              </div>
+            </div>
+          )}
+
           {/* Copyable Address Cards */}
           <div className="flex flex-wrap items-center gap-2.5 pt-1">
             {/* Main DNS Hostname */}

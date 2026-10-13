@@ -8,6 +8,7 @@ import {
   ActionRowBuilder,
   StringSelectMenuBuilder,
   StringSelectMenuOptionBuilder,
+  AttachmentBuilder,
   type ChatInputCommandInteraction,
   type StringSelectMenuInteraction,
 } from 'discord.js';
@@ -17,10 +18,8 @@ import type { AternosState } from '../types/aternos.ts';
 import { serverStorage } from './serverStorage.ts';
 import { queryMinecraftServer } from './mcPing.ts';
 
-const DISCORD_BOT_TOKEN =
-  process.env.DISCORD_BOT_TOKEN ||
-  'MTU1NTMzMDg1Njc1Nzc1NTk5NA.GLEqGe.jXMPh6b0PV8HEOB0sKBRbGTkOTBxgGmiX3tSOQ';
-const DISCORD_CLIENT_ID = '1555330856757755994';
+const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN || '';
+const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID || '1555330856757755994';
 
 interface DiscoveredServer {
   id: string;
@@ -50,6 +49,9 @@ export class DiscordBotService {
   private canCreateApplicationEmojis: boolean = true;
   private emojiQueue: string[] = [];
   private isProcessingEmojiQueue: boolean = false;
+
+  // In-memory cache for bordered player head image buffers attached to Discord messages
+  private borderedHeadCache: Map<string, { buffer: Buffer; timestamp: number }> = new Map();
 
   // Pending server selections for /configure
   private pendingSelections: Map<string, PendingSession> = new Map();
@@ -135,8 +137,10 @@ export class DiscordBotService {
       if (emojis) {
         emojis.forEach((e: any) => {
           if (e.name) {
-            const cleanKey = e.name.toLowerCase().replace(/^head_/, '');
-            this.playerEmojiCache.set(cleanKey, `<:${e.name}:${e.id}>`);
+            const cleanKey = e.name.toLowerCase().replace(/^(?:bhead_|head_)/, '');
+            if (!this.playerEmojiCache.has(cleanKey) || e.name.startsWith('bhead_')) {
+              this.playerEmojiCache.set(cleanKey, `<:${e.name}:${e.id}>`);
+            }
           }
         });
         console.log(`[Discord Bot] Loaded ${emojis.size} pre-existing application head emojis into memory cache.`);
@@ -266,8 +270,9 @@ export class DiscordBotService {
 
     // 2. Check Discord client application emoji cache
     const app = this.client.application as any;
-    const emojiName = `head_${cacheKey}`;
-    const found = app?.emojis?.cache?.find((e: any) => e.name === emojiName);
+    const emojiName = `bhead_${cacheKey}`;
+    const legacyName = `head_${cacheKey}`;
+    const found = app?.emojis?.cache?.find((e: any) => e.name === emojiName || e.name === legacyName);
     if (found) {
       const formatted = `<:${found.name}:${found.id}>`;
       this.playerEmojiCache.set(cacheKey, formatted);
@@ -318,7 +323,7 @@ export class DiscordBotService {
       const app = this.client.application as any;
       if (!app?.emojis) return;
 
-      const emojiName = `head_${cacheKey}`;
+      const emojiName = `bhead_${cacheKey}`;
       let appEmojis = app.emojis.cache;
       if (!appEmojis || appEmojis.size === 0) {
         appEmojis = await app.emojis.fetch().catch(() => null);
@@ -330,9 +335,9 @@ export class DiscordBotService {
         return;
       }
 
-      // If near limit of 50 emojis, delete oldest head_ emoji
+      // If near limit of 50 emojis, delete oldest head_ or bhead_ emoji
       if (appEmojis && appEmojis.size >= 48) {
-        const oldest = appEmojis.find((e: any) => e.name?.startsWith('head_'));
+        const oldest = appEmojis.find((e: any) => e.name?.startsWith('head_') || e.name?.startsWith('bhead_'));
         if (oldest) {
           await oldest.delete().catch(() => {});
         }
@@ -364,13 +369,24 @@ export class DiscordBotService {
       if (!imageBuf) return;
 
       const size = 64;
-      const radius = 16;
-      const roundedCornersSvg = Buffer.from(
-        `<svg><rect x="0" y="0" width="${size}" height="${size}" rx="${radius}" ry="${radius}"/></svg>`
+      const radius = 14;
+      // High-contrast crisp border around player head image (dark base outline + emerald ring + crisp white highlight)
+      const maskSvg = Buffer.from(
+        `<svg width="${size}" height="${size}"><rect x="0" y="0" width="${size}" height="${size}" rx="${radius}" ry="${radius}" fill="white"/></svg>`
+      );
+      const borderSvg = Buffer.from(
+        `<svg width="${size}" height="${size}">
+          <rect x="1" y="1" width="${size - 2}" height="${size - 2}" rx="${radius}" ry="${radius}" fill="none" stroke="#18181b" stroke-width="4"/>
+          <rect x="1.5" y="1.5" width="${size - 3}" height="${size - 3}" rx="${radius}" ry="${radius}" fill="none" stroke="#10b981" stroke-width="3"/>
+          <rect x="2.5" y="2.5" width="${size - 5}" height="${size - 5}" rx="${radius - 1}" ry="${radius - 1}" fill="none" stroke="#ffffff" stroke-width="2" stroke-opacity="0.95"/>
+        </svg>`
       );
       const roundedBuf = await sharp(imageBuf)
         .resize(size, size)
-        .composite([{ input: roundedCornersSvg, blend: 'dest-in' }])
+        .composite([
+          { input: maskSvg, blend: 'dest-in' },
+          { input: borderSvg, blend: 'over' },
+        ])
         .png()
         .toBuffer();
 
@@ -389,34 +405,209 @@ export class DiscordBotService {
     }
   }
 
-  // Build real-time server status diagnostics embed
-  // Shows small player heads for players, NO big player head thumbnail!
-  private buildStatusEmbed(serverAddress: string, state: any, live: any): EmbedBuilder {
-    const canonicalAddr = serverStorage.getCanonicalServerAddress(serverAddress);
-    const isOnline = state.status === 'online' || live?.online;
-    const statusText = isOnline
-      ? '🟢 Online'
-      : state.status === 'starting'
-      ? '🟡 Starting'
-      : state.status === 'queue'
-      ? '⏳ In Queue'
-      : '🔴 Offline';
+  // Generate a standalone high-resolution bordered player head image buffer for message attachments
+  public async generateBorderedPlayerHead(
+    playerName: string,
+    statusColorHex = '#10b981'
+  ): Promise<Buffer | null> {
+    const cleanName = (playerName || 'Steve').trim();
+    const cacheKey = `${cleanName.toLowerCase()}_${statusColorHex.toLowerCase()}`;
+    const cached = this.borderedHeadCache.get(cacheKey);
+    if (cached && Date.now() - cached.timestamp < 15 * 60 * 1000) {
+      return cached.buffer;
+    }
 
-    const color = isOnline ? 0x10b981 : state.status === 'starting' ? 0xf59e0b : 0xef4444;
-    const playerCount = Math.max(live?.players?.online || 0, state.playersOnline || 0);
+    const candidateUrls = [
+      `https://mc-heads.net/avatar/${encodeURIComponent(cleanName)}/136`,
+      `https://crafthead.net/helm/${encodeURIComponent(cleanName)}/136`,
+      `https://minotar.net/helm/${encodeURIComponent(cleanName)}/136.png`,
+    ];
+
+    let rawBuf: Buffer | null = null;
+    for (const url of candidateUrls) {
+      try {
+        const ac = new AbortController();
+        const tm = setTimeout(() => ac.abort(), 2000);
+        const res = await fetch(url, { signal: ac.signal });
+        clearTimeout(tm);
+        if (res.ok) {
+          const arrayBuf = await res.arrayBuffer();
+          if (arrayBuf.byteLength > 200) {
+            rawBuf = Buffer.from(arrayBuf);
+            break;
+          }
+        }
+      } catch {}
+    }
+
+    // Fallback: If network failed, fetch default Steve avatar
+    if (!rawBuf && cleanName.toLowerCase() !== 'steve') {
+      try {
+        const res = await fetch('https://mc-heads.net/avatar/Steve/136');
+        if (res.ok) {
+          rawBuf = Buffer.from(await res.arrayBuffer());
+        }
+      } catch {}
+    }
+
+    if (!rawBuf) return null;
+
+    try {
+      const canvasSize = 160;
+      const avatarSize = 136;
+      const offset = 12; // (160 - 136) / 2
+      const radius = 24;
+
+      const maskSvg = Buffer.from(
+        `<svg width="${avatarSize}" height="${avatarSize}"><rect x="0" y="0" width="${avatarSize}" height="${avatarSize}" rx="${radius}" ry="${radius}" fill="white"/></svg>`
+      );
+
+      const roundedAvatar = await sharp(rawBuf)
+        .resize(avatarSize, avatarSize)
+        .composite([{ input: maskSvg, blend: 'dest-in' }])
+        .png()
+        .toBuffer();
+
+      const borderOverlaySvg = Buffer.from(
+        `<svg width="${canvasSize}" height="${canvasSize}">
+          <!-- Outer dark foundation frame -->
+          <rect x="${offset - 2}" y="${offset - 2}" width="${avatarSize + 4}" height="${avatarSize + 4}" rx="${radius + 2}" ry="${radius + 2}" fill="none" stroke="#09090b" stroke-width="6"/>
+          <!-- Prominent Glowing Border -->
+          <rect x="${offset}" y="${offset}" width="${avatarSize}" height="${avatarSize}" rx="${radius}" ry="${radius}" fill="none" stroke="${statusColorHex}" stroke-width="6"/>
+          <!-- Inner Bright Accent Ring -->
+          <rect x="${offset + 2}" y="${offset + 2}" width="${avatarSize - 4}" height="${avatarSize - 4}" rx="${radius - 2}" ry="${radius - 2}" fill="none" stroke="#ffffff" stroke-width="3" stroke-opacity="0.95"/>
+        </svg>`
+      );
+
+      const finalCard = await sharp({
+        create: {
+          width: canvasSize,
+          height: canvasSize,
+          channels: 4,
+          background: { r: 0, g: 0, b: 0, alpha: 0 },
+        },
+      })
+        .composite([
+          { input: roundedAvatar, left: offset, top: offset },
+          { input: borderOverlaySvg, left: 0, top: 0 },
+        ])
+        .png()
+        .toBuffer();
+
+      this.borderedHeadCache.set(cacheKey, { buffer: finalCard, timestamp: Date.now() });
+      return finalCard;
+    } catch (err: any) {
+      console.warn('[Sharp Avatar Error]', err?.message);
+      return null;
+    }
+  }
+
+  // Build real-time server status diagnostics embed with bordered player head attachment
+  private async buildStatusEmbed(
+    serverAddress: string,
+    state: any,
+    live: any,
+    fallbackUser?: string
+  ): Promise<{ embed: EmbedBuilder; files: AttachmentBuilder[] }> {
+    const canonicalAddr = serverStorage.getCanonicalServerAddress(serverAddress);
+    const files: AttachmentBuilder[] = [];
+
+    // Precise status determination:
+    const isAternosOffline = state.status === 'offline';
+    const isAternosStopping = state.status === 'stopping';
+    const isAternosStarting = state.status === 'starting';
+    const isAternosQueue = state.status === 'queue';
+
+    let isOnline = false;
+    let statusText = '🔴 Offline';
+    let color = 0xef4444;
+    let hexColor = '#ef4444';
+
+    if (isAternosStarting) {
+      statusText = `🟡 ${state.rawStatus || 'Starting ...'}`;
+      color = 0xf59e0b;
+      hexColor = '#f59e0b';
+    } else if (isAternosQueue) {
+      statusText = '⏳ In Queue';
+      color = 0xf59e0b;
+      hexColor = '#f59e0b';
+    } else if (isAternosStopping) {
+      statusText = '🟠 Stopping';
+      color = 0xf97316;
+      hexColor = '#f97316';
+    } else if (!isAternosOffline && (state.status === 'online' || live?.online)) {
+      isOnline = true;
+      statusText = '🟢 Online';
+      color = 0x10b981;
+      hexColor = '#10b981';
+    } else {
+      isOnline = false;
+      statusText = '🔴 Offline';
+      color = 0xef4444;
+      hexColor = '#ef4444';
+    }
+
+    const playerCount = isOnline ? Math.max(live?.players?.online || 0, state.playersOnline || 0) : 0;
     const maxCount = live?.players?.max || state.maxPlayers || 20;
+
+    // Active player names
+    const playerNames: string[] = [];
+    if (isOnline) {
+      if (Array.isArray(live?.players?.list)) {
+        for (const p of live.players.list) {
+          if (p?.name && !playerNames.includes(p.name)) playerNames.push(p.name);
+        }
+      }
+      if (Array.isArray(state.playerList)) {
+        for (const name of state.playerList) {
+          if (name && !playerNames.includes(name)) playerNames.push(name);
+        }
+      }
+    }
+
+    // Determine target player name for the bordered head thumbnail
+    const targetPlayer = playerNames.length > 0 ? playerNames[0] : (fallbackUser || 'Steve');
+
+    // ALWAYS attach the bordered player head image in the Discord message
+    const headBuf = await this.generateBorderedPlayerHead(targetPlayer, hexColor);
+    if (headBuf) {
+      const attachment = new AttachmentBuilder(headBuf, { name: 'player_head.png' });
+      files.push(attachment);
+    }
+
+    // Clean bordered status card in message description
+    const statusLine = `Status  : ${isOnline ? '🟢 Online' : isAternosStarting ? '🟡 Starting' : isAternosStopping ? '🟠 Stopping' : '🔴 Offline'}`;
+    const playerLine = `Players : ${playerCount}/${maxCount} active`;
+    const hostLine = `Address : ${canonicalAddr}:${state.serverPort || 25565}`;
+
+    const maxLen = Math.max(statusLine.length, playerLine.length, hostLine.length, 36);
+    const topBorder = `┌${'─'.repeat(maxLen + 4)}┐`;
+    const bottomBorder = `└${'─'.repeat(maxLen + 4)}┘`;
+    const cardBox = [
+      '```',
+      topBorder,
+      `│  ${statusLine.padEnd(maxLen + 2)}│`,
+      `│  ${playerLine.padEnd(maxLen + 2)}│`,
+      `│  ${hostLine.padEnd(maxLen + 2)}│`,
+      bottomBorder,
+      '```',
+    ].join('\n');
 
     const embed = new EmbedBuilder()
       .setColor(color)
       .setTitle(`🎮 Minecraft Server Diagnostics`)
-      .setDescription(`Live status for **${canonicalAddr}**:`)
+      .setDescription(cardBox)
       .addFields(
         { name: 'Status', value: `**${statusText}**`, inline: true },
         { name: 'Players Online', value: `\`${playerCount}/${maxCount}\` active`, inline: true },
         { name: 'Server Address', value: `\`${canonicalAddr}:${state.serverPort || 25565}\``, inline: true }
       );
 
-    if (state.dynip) {
+    if (files.length > 0) {
+      embed.setThumbnail('attachment://player_head.png');
+    }
+
+    if (isOnline && state.dynip) {
       embed.addFields({ name: 'Direct Connect IP', value: `\`${state.dynip}\``, inline: true });
     }
 
@@ -428,20 +619,8 @@ export class DiscordBotService {
       });
     }
 
-    // Active players list with small player heads (NO big thumbnail)
-    const playerNames: string[] = [];
-    if (Array.isArray(live?.players?.list)) {
-      for (const p of live.players.list) {
-        if (p?.name && !playerNames.includes(p.name)) playerNames.push(p.name);
-      }
-    }
-    if (Array.isArray(state.playerList)) {
-      for (const name of state.playerList) {
-        if (name && !playerNames.includes(name)) playerNames.push(name);
-      }
-    }
-
-    if (playerNames.length > 0) {
+    // Active players list with small player heads
+    if (isOnline && playerNames.length > 0) {
       const playerListItems = playerNames.map(n => {
         const head = this.getPlayerHeadEmoji(n);
         return `${head} **${n}**`;
@@ -453,7 +632,7 @@ export class DiscordBotService {
       });
     }
 
-    if (state.motd || live?.motd) {
+    if (isOnline && (state.motd || live?.motd)) {
       embed.addFields({
         name: '📜 MOTD',
         value: `*${state.motd || live?.motd}*`,
@@ -461,9 +640,17 @@ export class DiscordBotService {
       });
     }
 
+    // Keepalive Timer: ONLY when the server is genuinely ONLINE.
+    // Never show on offline or stopping servers.
     if (isOnline) {
-      if (playerCount === 0) {
-        const secs = state.countdownSeconds ?? 360;
+      if (playerCount > 0) {
+        embed.addFields({
+          name: '⏱️ Keepalive Timer',
+          value: `🟢 **Paused** (${playerCount} active player${playerCount > 1 ? 's' : ''} connected)`,
+          inline: false,
+        });
+      } else if (state.countdownActive && typeof state.countdownSeconds === 'number' && state.countdownSeconds > 0) {
+        const secs = state.countdownSeconds;
         const mins = Math.floor(secs / 60);
         const s = secs % 60;
         const formatted = state.countdownFormatted || `${mins}:${s < 10 ? '0' : ''}${s}`;
@@ -474,20 +661,14 @@ export class DiscordBotService {
           value: `\`${formatted}\` remaining • Auto-shutdown <t:${targetEpoch}:R>\n*(Synced with Aternos dashboard)*`,
           inline: false,
         });
-      } else {
-        embed.addFields({
-          name: '⏱️ Keepalive Timer',
-          value: `🟢 **Paused** (${playerCount} active player${playerCount > 1 ? 's' : ''} connected)`,
-          inline: false,
-        });
       }
     }
 
-    // Set bot icon only in footer (NO big thumbnail)
+    // Set bot icon only in footer
     embed.setFooter({ text: 'Aternos Command Center', iconURL: this.client.user?.displayAvatarURL() });
     embed.setTimestamp();
 
-    return embed;
+    return { embed, files };
   }
 
   // Fast resolution of fresh Aternos + Minecraft live status with concurrency protection
@@ -495,7 +676,7 @@ export class DiscordBotService {
     let state: AternosState = aternosService.getState(serverAddress);
 
     // Sync from Aternos if offline or older than 3.5s, with strict 2500ms max timeout so Discord never lags
-    if (sessionCookie && (state.status === 'offline' || Date.now() - state.lastUpdated > 3500)) {
+    if (sessionCookie || Date.now() - state.lastUpdated > 3500) {
       try {
         const syncTimeout = new Promise<AternosState>(resolve => setTimeout(() => resolve(state), 2500));
         state = await Promise.race([aternosService.syncSessionState(serverAddress), syncTimeout]);
@@ -509,6 +690,16 @@ export class DiscordBotService {
       state.playerList || [],
       state.status === 'online' || state.status === 'starting'
     );
+
+    // If server is offline or stopping, guarantee all countdown states are reset
+    if (state.status === 'offline' || state.status === 'stopping' || (!live?.online && state.status !== 'online' && state.status !== 'starting')) {
+      state.countdownActive = false;
+      state.countdownSeconds = null;
+      state.countdownFormatted = null;
+      state.canExtend = false;
+      state.playersOnline = 0;
+      state.playerList = [];
+    }
 
     return { state, live };
   }
@@ -829,8 +1020,9 @@ export class DiscordBotService {
           const ctx = this.resolveServerContext(contextId, user.id);
           const { state, live } = await this.getFastServerState(ctx.serverAddress, ctx.sessionCookie);
 
-          const embed = this.buildStatusEmbed(ctx.serverAddress, state, live);
-          await interaction.editReply({ embeds: [embed] });
+          const fallbackUser = ctx.profile?.discordUser || user.username;
+          const { embed, files } = await this.buildStatusEmbed(ctx.serverAddress, state, live, fallbackUser);
+          await interaction.editReply({ embeds: [embed], files });
           break;
         }
 
@@ -840,12 +1032,32 @@ export class DiscordBotService {
 
           const isOnline = live.online || state.status === 'online' || state.status === 'starting';
 
+          // Generate bordered avatar image buffer for thumbnail
+          const targetPlayer = (state.playerList && state.playerList[0]) || ctx.profile?.discordUser || user.username || 'Steve';
+          const headBuf = await this.generateBorderedPlayerHead(targetPlayer, isOnline ? '#10b981' : '#ef4444');
+          const files: AttachmentBuilder[] = [];
+          if (headBuf) {
+            files.push(new AttachmentBuilder(headBuf, { name: 'player_head.png' }));
+          }
+
           if (!isOnline) {
             const embed = new EmbedBuilder()
               .setColor(0xef4444)
               .setTitle('🔴 Server is Offline')
-              .setDescription(`Cannot fetch active players because **${ctx.serverAddress}** is currently offline.\nUse \`/start\` to bring the server online.`);
-            await interaction.editReply({ embeds: [embed] });
+              .setDescription([
+                '```',
+                '┌──────────────────────────────────────────┐',
+                '│  Server is currently offline.            │',
+                '│  Active players cannot be queried.       │',
+                '└──────────────────────────────────────────┘',
+                '```',
+                `Cannot fetch active players because **${ctx.serverAddress}** is currently offline.\nUse \`/start\` to bring the server online.`,
+              ].join('\n'));
+
+            if (files.length > 0) {
+              embed.setThumbnail('attachment://player_head.png');
+            }
+            await interaction.editReply({ embeds: [embed], files });
             return;
           }
 
@@ -866,10 +1078,22 @@ export class DiscordBotService {
             const embed = new EmbedBuilder()
               .setColor(0x71717a)
               .setTitle(`👥 No Players Online (0/${max})`)
-              .setDescription(`There are currently 0 players connected to **${ctx.serverAddress}**.\nThe world is quiet and waiting for players to join.`);
+              .setDescription([
+                '```',
+                '┌──────────────────────────────────────────┐',
+                '│  0 players currently connected.          │',
+                '│  The world is waiting for players.       │',
+                '└──────────────────────────────────────────┘',
+                '```',
+                `There are currently 0 players connected to **${ctx.serverAddress}**.`,
+              ].join('\n'));
 
-            if (isOnline) {
-              const secs = state.countdownSeconds ?? 360;
+            if (files.length > 0) {
+              embed.setThumbnail('attachment://player_head.png');
+            }
+
+            if (isOnline && state.countdownActive && typeof state.countdownSeconds === 'number' && state.countdownSeconds > 0) {
+              const secs = state.countdownSeconds;
               const mins = Math.floor(secs / 60);
               const s = secs % 60;
               const formatted = state.countdownFormatted || `${mins}:${s < 10 ? '0' : ''}${s}`;
@@ -885,7 +1109,7 @@ export class DiscordBotService {
             embed.setFooter({ text: 'Aternos Command Center', iconURL: this.client.user?.displayAvatarURL() });
             embed.setTimestamp();
 
-            await interaction.editReply({ embeds: [embed] });
+            await interaction.editReply({ embeds: [embed], files });
             return;
           }
 
@@ -895,8 +1119,11 @@ export class DiscordBotService {
             .setDescription(`Active players currently connected to **${ctx.serverAddress}**:`)
             .setTimestamp();
 
+          if (files.length > 0) {
+            embed.setThumbnail('attachment://player_head.png');
+          }
+
           if (combinedList.length > 0) {
-            // Render clean player lines with small player heads, NO skin links, NO big head thumbnail
             const playerLines = combinedList.map((name, idx) => {
               const headEmoji = this.getPlayerHeadEmoji(name);
               return `**${idx + 1}.** ${headEmoji} **${name}**`;
@@ -911,7 +1138,7 @@ export class DiscordBotService {
             iconURL: this.client.user?.displayAvatarURL(),
           });
 
-          await interaction.editReply({ embeds: [embed] });
+          await interaction.editReply({ embeds: [embed], files });
           break;
         }
 

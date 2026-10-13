@@ -730,6 +730,10 @@ export class AternosAutomationManager {
       inst.state.countdownActive = false;
       inst.state.countdownSeconds = null;
       inst.state.countdownFormatted = null;
+      inst.state.canExtend = false;
+      inst.state.playersOnline = 0;
+      inst.state.playerList = [];
+      inst.state.dynip = undefined;
     }
 
     if (lastStatus.slots !== undefined) inst.state.maxPlayers = Number(lastStatus.slots);
@@ -1395,19 +1399,14 @@ export class AternosAutomationManager {
       if (inst.state.status === 'online') {
         const players = inst.state.playersOnline ?? 0;
         if (players === 0) {
-          if (inst.state.countdownSeconds === null || inst.state.countdownSeconds === undefined) {
-            inst.state.countdownSeconds = 360;
-          }
-          if (inst.state.countdownSeconds > 0) {
-            inst.state.countdownActive = true;
+          if (inst.state.countdownActive && typeof inst.state.countdownSeconds === 'number' && inst.state.countdownSeconds > 0) {
             inst.state.countdownSeconds -= 1;
             const m = Math.floor(inst.state.countdownSeconds / 60);
             const s = inst.state.countdownSeconds % 60;
             inst.state.countdownFormatted = `${m}:${s < 10 ? '0' : ''}${s}`;
             inst.state.canExtend = inst.state.countdownSeconds <= 60;
-          } else {
+          } else if (inst.state.countdownSeconds === 0) {
             inst.state.countdownActive = false;
-            inst.state.countdownSeconds = 0;
             inst.state.countdownFormatted = '0:00';
             inst.state.canExtend = false;
           }
@@ -1416,6 +1415,9 @@ export class AternosAutomationManager {
         }
       } else {
         inst.state.countdownActive = false;
+        inst.state.countdownSeconds = null;
+        inst.state.countdownFormatted = null;
+        inst.state.canExtend = false;
       }
     }
   }
