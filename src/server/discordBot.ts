@@ -10,10 +10,10 @@ import {
   StringSelectMenuOptionBuilder,
   type ChatInputCommandInteraction,
   type StringSelectMenuInteraction,
-  type Message,
 } from 'discord.js';
 import sharp from 'sharp';
 import { aternosService } from './aternosAutomation.ts';
+import type { AternosState } from '../types/aternos.ts';
 import { serverStorage } from './serverStorage.ts';
 import { queryMinecraftServer } from './mcPing.ts';
 
@@ -45,28 +45,23 @@ export class DiscordBotService {
   private lastPing: number = 0;
   private initError: string | null = null;
 
-  // Track previous interactions and messages to auto-delete old bot responses
-  private lastUserInteractions: Map<string, ChatInputCommandInteraction> = new Map();
-  private lastUserMessages: Map<string, Message> = new Map();
-
   // Player head emoji cache: playerName.toLowerCase() -> '<:head_name:id>'
   private playerEmojiCache: Map<string, string> = new Map();
-  // Sequential queue for emoji creation to prevent rate limits
-  private emojiQueue: Promise<void> = Promise.resolve();
-
-  // Active live ticker updaters for status countdown
-  private activeTickers: Map<string, { interval: NodeJS.Timeout; stop: () => void }> = new Map();
+  private canCreateApplicationEmojis: boolean = true;
+  private emojiQueue: string[] = [];
+  private isProcessingEmojiQueue: boolean = false;
 
   // Pending server selections for /configure
   private pendingSelections: Map<string, PendingSession> = new Map();
 
+  // Track previous interactions per user to delete older messages when a new command is run
+  private userLastInteractions: Map<string, { interaction: any; timestamp: number }[]> = new Map();
+
   constructor() {
+    // ONLY Guilds intent — no message content or message events needed
     this.client = new Client({
       intents: [
         GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent,
-        GatewayIntentBits.DirectMessages,
       ],
     });
 
@@ -89,26 +84,33 @@ export class DiscordBotService {
         message: `Connected in ${this.client.guilds.cache.size} server(s)`,
       });
 
+      // Preload application emojis into cache for 0ms lookup
+      await this.loadExistingApplicationEmojis();
+
+      // Register clean slash commands (no optional address parameter)
       await this.registerSlashCommands();
     });
 
-    // Interaction handler (Slash Commands & Select Menus)
+    // Interaction handler (ONLY Slash Commands & Select Menus - NO ! commands)
     this.client.on('interactionCreate', async interaction => {
-      if (interaction.isChatInputCommand()) {
-        await this.handleSlashCommand(interaction);
-      } else if (interaction.isStringSelectMenu()) {
-        await this.handleSelectMenu(interaction);
+      try {
+        if (interaction.isChatInputCommand()) {
+          // Fire non-blocking so simultaneous commands never stall each other
+          this.handleSlashCommand(interaction).catch(err => {
+            console.error('[Slash Command Unhandled]', err);
+          });
+        } else if (interaction.isStringSelectMenu()) {
+          this.handleSelectMenu(interaction).catch(err => {
+            console.error('[Select Menu Unhandled]', err);
+          });
+        }
+      } catch (err: any) {
+        console.error('[Discord Interaction Event Error]', err);
       }
     });
 
-    // Message Prefix Handler (!status, !start, etc.)
-    this.client.on('messageCreate', async message => {
-      if (message.author.bot) return;
-      await this.handleMessageFallback(message);
-    });
-
     this.client.on('error', err => {
-      console.error('[Discord Bot Error]', err);
+      console.error('[Discord Bot Error]', err?.message);
       this.initError = err.message;
     });
   }
@@ -123,14 +125,34 @@ export class DiscordBotService {
     }
   }
 
-  // Register clean Slash Commands with NO optional address options
+  // Pre-fetch all application emojis at startup so lookups are 0ms in-memory
+  private async loadExistingApplicationEmojis(): Promise<void> {
+    try {
+      const app = this.client.application as any;
+      if (!app?.emojis) return;
+
+      const emojis = await app.emojis.fetch().catch(() => null);
+      if (emojis) {
+        emojis.forEach((e: any) => {
+          if (e.name) {
+            const cleanKey = e.name.toLowerCase().replace(/^head_/, '');
+            this.playerEmojiCache.set(cleanKey, `<:${e.name}:${e.id}>`);
+          }
+        });
+        console.log(`[Discord Bot] Loaded ${emojis.size} pre-existing application head emojis into memory cache.`);
+      }
+    } catch (err: any) {
+      console.warn('[Discord Bot] Could not preload application emojis:', err?.message);
+    }
+  }
+
+  // Register Clean Slash Commands WITHOUT optional server address parameter
   private async registerSlashCommands() {
     const commands = [
       new SlashCommandBuilder()
         .setName('configure')
         .setDescription('Link your Aternos server with your session')
-        .addStringOption(o => o.setName('session').setDescription('Aternos session cookie').setRequired(true))
-        .addStringOption(o => o.setName('server').setDescription('Optional server ID (leave empty to pick from list)').setRequired(false)),
+        .addStringOption(o => o.setName('session').setDescription('Aternos session cookie').setRequired(true)),
 
       new SlashCommandBuilder()
         .setName('start')
@@ -150,7 +172,7 @@ export class DiscordBotService {
 
       new SlashCommandBuilder()
         .setName('players')
-        .setDescription('View connected players and their skin head avatars'),
+        .setDescription('View connected players and their small avatars'),
     ];
 
     try {
@@ -158,7 +180,7 @@ export class DiscordBotService {
       await rest.put(Routes.applicationCommands(this.botId || DISCORD_CLIENT_ID), {
         body: commands.map(cmd => cmd.toJSON()),
       });
-      console.log('[Discord Bot] Global slash commands registered (clean parameters).');
+      console.log('[Discord Bot] Clean slash commands registered successfully.');
     } catch (err: any) {
       console.warn('[Discord Bot] Slash commands notice:', err?.message);
     }
@@ -168,12 +190,6 @@ export class DiscordBotService {
     let binding = serverStorage.getDiscordBinding(contextId);
     if (!binding && userId) {
       binding = serverStorage.getDiscordBinding(userId);
-    }
-    if (!binding) {
-      const allBindings = serverStorage.getAllDiscordBindings();
-      if (allBindings.length > 0) {
-        binding = allBindings[0];
-      }
     }
 
     if (binding) {
@@ -186,184 +202,195 @@ export class DiscordBotService {
       };
     }
 
-    const all = serverStorage.getAllProfiles();
-    const discordProfile = all.find(p => p.source === 'discord') || all[0];
-    if (discordProfile) {
-      const canonical = serverStorage.getCanonicalServerAddress(discordProfile.serverIp);
+    // Check if ANY known server is currently ONLINE in aternosService
+    const allStates = aternosService.getAllStates();
+    const allProfiles = serverStorage.getAllProfiles();
+    for (const p of allProfiles) {
+      const pCanon = serverStorage.getCanonicalServerAddress(p.serverIp || p.name);
+      const st = allStates[pCanon.toLowerCase()] || allStates[p.id];
+      if (st && (st.status === 'online' || st.status === 'starting')) {
+        return {
+          serverAddress: pCanon,
+          sessionCookie: p.sessionCookie,
+          serverCookie: p.serverCookie,
+          profile: p,
+        };
+      }
+    }
+
+    // Next, check active server configured in aternosService
+    const cfg = aternosService.getConfig();
+    if (cfg.serverAddress) {
+      const canonical = serverStorage.getCanonicalServerAddress(cfg.serverAddress);
+      const profile = serverStorage.getProfile(canonical) || serverStorage.getProfile(cfg.serverAddress);
       return {
         serverAddress: canonical,
-        sessionCookie: discordProfile.sessionCookie,
-        serverCookie: discordProfile.serverCookie,
-        profile: discordProfile,
+        sessionCookie: cfg.sessionCookie || profile?.sessionCookie || '',
+        serverCookie: cfg.serverCookie || profile?.serverCookie || '',
+        profile,
       };
     }
 
-    const cfg = aternosService.getConfig();
-    const canonical = serverStorage.getCanonicalServerAddress(cfg.serverAddress || 'Bang_Bros_SMP.aternos.me');
+    // Fallback to first available profile
+    if (allProfiles.length > 0) {
+      const p = allProfiles[0];
+      const canonical = serverStorage.getCanonicalServerAddress(p.serverIp || p.name);
+      return {
+        serverAddress: canonical,
+        sessionCookie: p.sessionCookie,
+        serverCookie: p.serverCookie,
+        profile: p,
+      };
+    }
+
+    const defaultCanonical = 'Bang_Bros_SMP.aternos.me';
     return {
-      serverAddress: canonical,
-      sessionCookie: cfg.sessionCookie || '',
-      serverCookie: cfg.serverCookie || '',
+      serverAddress: defaultCanonical,
+      sessionCookie: '',
+      serverCookie: '',
     };
   }
 
-  // Deletes previous bot messages for this user in interaction or channel and clears tickers
-  private async clearPreviousBotMessages(userId: string, channel: any) {
-    const runningTicker = this.activeTickers.get(userId);
-    if (runningTicker) {
-      runningTicker.stop();
-      this.activeTickers.delete(userId);
-    }
-
-    const prevInteraction = this.lastUserInteractions.get(userId);
-    if (prevInteraction) {
-      try {
-        await prevInteraction.deleteReply();
-      } catch {}
-      this.lastUserInteractions.delete(userId);
-    }
-
-    const prevMessage = this.lastUserMessages.get(userId);
-    if (prevMessage) {
-      try {
-        await prevMessage.delete();
-      } catch {}
-      this.lastUserMessages.delete(userId);
-    }
-
-    if (channel && 'messages' in channel && typeof channel.messages.fetch === 'function') {
-      try {
-        const recent = await channel.messages.fetch({ limit: 10 });
-        const botMsgs = recent.filter((m: Message) => m.author.id === this.client.user?.id);
-        for (const msg of botMsgs.values()) {
-          if (Date.now() - msg.createdTimestamp < 900000) {
-            await msg.delete().catch(() => {});
-          }
-        }
-      } catch {}
-    }
-  }
-
-  // Get or dynamically create small Minecraft player head emoji with rounded corners
-  private async getPlayerHeadEmoji(playerName: string): Promise<string> {
+  // Instant 0ms synchronous head emoji lookup.
+  // Never blocks, never stalls commands, never causes Discord rate limit issues.
+  // If emoji exists in memory, returns <:head_name:id>.
+  // If not, returns 👤 immediately and queues background creation.
+  private getPlayerHeadEmoji(playerName: string): string {
     const cleanName = playerName.trim();
     if (!cleanName) return '👤';
-    const cacheKey = cleanName.toLowerCase();
-    if (this.playerEmojiCache.has(cacheKey)) {
-      return this.playerEmojiCache.get(cacheKey)!;
+    const cacheKey = cleanName.toLowerCase().replace(/[^a-z0-9_]/g, '_').slice(0, 26);
+
+    // 1. Direct hit in memory cache
+    const cached = this.playerEmojiCache.get(cacheKey);
+    if (cached) return cached;
+
+    // 2. Check Discord client application emoji cache
+    const app = this.client.application as any;
+    const emojiName = `head_${cacheKey}`;
+    const found = app?.emojis?.cache?.find((e: any) => e.name === emojiName);
+    if (found) {
+      const formatted = `<:${found.name}:${found.id}>`;
+      this.playerEmojiCache.set(cacheKey, formatted);
+      return formatted;
     }
 
-    return new Promise((resolve) => {
-      this.emojiQueue = this.emojiQueue.then(async () => {
-        try {
-          const res = await this.resolvePlayerEmojiInternal(cleanName);
-          resolve(res);
-        } catch {
-          resolve('👤');
-        }
-      });
-    });
-  }
-
-  private async resolvePlayerEmojiInternal(cleanName: string): Promise<string> {
-    const cacheKey = cleanName.toLowerCase();
-    if (this.playerEmojiCache.has(cacheKey)) {
-      return this.playerEmojiCache.get(cacheKey)!;
-    }
-
-    // Format safe emoji name: only lowercase alphanumeric and underscores, max 26 chars
-    const emojiName = `head_${cleanName.toLowerCase().replace(/[^a-z0-9_]/g, '_').slice(0, 26)}`;
-
-    try {
-      const app = this.client.application as any;
-      if (!app) return '👤';
-
-      // Check existing application emojis cache
-      let appEmojis = app.emojis?.cache;
-      if (!appEmojis || appEmojis.size === 0) {
-        appEmojis = await app.emojis?.fetch();
-      }
-
-      const existing = appEmojis?.find((e: any) => e.name === emojiName);
-      if (existing) {
-        const formatted = `<:${existing.name}:${existing.id}>`;
-        this.playerEmojiCache.set(cacheKey, formatted);
-        return formatted;
-      }
-
-      if (app.emojis) {
-        // If approaching Discord's 50 application emoji limit, prune oldest head emoji
-        if (appEmojis && appEmojis.size >= 48) {
-          const oldest = appEmojis.find((e: any) => e.name?.startsWith('head_'));
-          if (oldest) {
-            await oldest.delete().catch(() => {});
-          }
-        }
-
-        // Multiple skin lookup candidates (handles Bedrock prefixes, 3D helmets & overlays)
-        const strippedName = cleanName.replace(/^[.*_]/, '');
-        const candidateUrls = [
-          `https://mc-heads.net/avatar/${encodeURIComponent(cleanName)}/64`,
-          `https://crafthead.net/helm/${encodeURIComponent(cleanName)}/64`,
-          ...(strippedName !== cleanName
-            ? [
-                `https://mc-heads.net/avatar/${encodeURIComponent(strippedName)}/64`,
-                `https://crafthead.net/helm/${encodeURIComponent(strippedName)}/64`,
-              ]
-            : []),
-          `https://minotar.net/helm/${encodeURIComponent(cleanName)}/64.png`,
-        ];
-
-        let imageBuf: Buffer | null = null;
-        for (const url of candidateUrls) {
-          try {
-            const res = await fetch(url);
-            if (res.ok) {
-              const arrayBuf = await res.arrayBuffer();
-              if (arrayBuf.byteLength > 200) {
-                imageBuf = Buffer.from(arrayBuf);
-                break;
-              }
-            }
-          } catch {}
-        }
-
-        if (!imageBuf) {
-          return '👤';
-        }
-
-        // Apply smooth rounded corners with sharp (anti-aliased transparent edges)
-        const size = 64;
-        const radius = 16;
-        const roundedCornersSvg = Buffer.from(
-          `<svg><rect x="0" y="0" width="${size}" height="${size}" rx="${radius}" ry="${radius}"/></svg>`
-        );
-        const roundedBuf = await sharp(imageBuf)
-          .resize(size, size)
-          .composite([{ input: roundedCornersSvg, blend: 'dest-in' }])
-          .png()
-          .toBuffer();
-
-        const created = await app.emojis.create({
-          attachment: roundedBuf,
-          name: emojiName,
-        });
-
-        const formatted = `<:${created.name}:${created.id}>`;
-        this.playerEmojiCache.set(cacheKey, formatted);
-
-        // Small delay to prevent Discord REST burst rate limiting on next player
-        await new Promise(r => setTimeout(r, 600));
-        return formatted;
-      }
-    } catch (err: any) {
-      console.warn(`[Discord Bot] Could not create head emoji for ${cleanName}:`, err?.message);
-    }
+    // 3. Queue non-blocking background creation (throttled, isolated)
+    this.queueBackgroundEmojiCreation(cleanName);
 
     return '👤';
   }
 
+  // Queue background head creation so it NEVER slows down user interactions
+  private queueBackgroundEmojiCreation(playerName: string) {
+    if (!this.canCreateApplicationEmojis) return;
+    const cleanKey = playerName.trim().toLowerCase().replace(/[^a-z0-9_]/g, '_').slice(0, 26);
+    if (this.playerEmojiCache.has(cleanKey)) return;
+    if (this.emojiQueue.includes(playerName)) return;
+
+    this.emojiQueue.push(playerName);
+    this.processEmojiQueue();
+  }
+
+  private async processEmojiQueue() {
+    if (this.isProcessingEmojiQueue || this.emojiQueue.length === 0) return;
+    this.isProcessingEmojiQueue = true;
+
+    try {
+      while (this.emojiQueue.length > 0) {
+        const nextName = this.emojiQueue.shift();
+        if (!nextName) continue;
+
+        const cleanKey = nextName.trim().toLowerCase().replace(/[^a-z0-9_]/g, '_').slice(0, 26);
+        if (this.playerEmojiCache.has(cleanKey)) continue;
+
+        await this.createHeadEmojiInBackground(nextName, cleanKey);
+
+        // Throttle 1500ms between creations to completely respect Discord REST limits
+        await new Promise(r => setTimeout(r, 1500));
+      }
+    } finally {
+      this.isProcessingEmojiQueue = false;
+    }
+  }
+
+  private async createHeadEmojiInBackground(cleanName: string, cacheKey: string): Promise<void> {
+    try {
+      const app = this.client.application as any;
+      if (!app?.emojis) return;
+
+      const emojiName = `head_${cacheKey}`;
+      let appEmojis = app.emojis.cache;
+      if (!appEmojis || appEmojis.size === 0) {
+        appEmojis = await app.emojis.fetch().catch(() => null);
+      }
+
+      const existing = appEmojis?.find((e: any) => e.name === emojiName);
+      if (existing) {
+        this.playerEmojiCache.set(cacheKey, `<:${existing.name}:${existing.id}>`);
+        return;
+      }
+
+      // If near limit of 50 emojis, delete oldest head_ emoji
+      if (appEmojis && appEmojis.size >= 48) {
+        const oldest = appEmojis.find((e: any) => e.name?.startsWith('head_'));
+        if (oldest) {
+          await oldest.delete().catch(() => {});
+        }
+      }
+
+      const candidateUrls = [
+        `https://mc-heads.net/avatar/${encodeURIComponent(cleanName)}/64`,
+        `https://crafthead.net/helm/${encodeURIComponent(cleanName)}/64`,
+        `https://minotar.net/helm/${encodeURIComponent(cleanName)}/64.png`,
+      ];
+
+      let imageBuf: Buffer | null = null;
+      for (const url of candidateUrls) {
+        try {
+          const controller = new AbortController();
+          const tm = setTimeout(() => controller.abort(), 1800);
+          const res = await fetch(url, { signal: controller.signal });
+          clearTimeout(tm);
+          if (res.ok) {
+            const arrayBuf = await res.arrayBuffer();
+            if (arrayBuf.byteLength > 200) {
+              imageBuf = Buffer.from(arrayBuf);
+              break;
+            }
+          }
+        } catch {}
+      }
+
+      if (!imageBuf) return;
+
+      const size = 64;
+      const radius = 16;
+      const roundedCornersSvg = Buffer.from(
+        `<svg><rect x="0" y="0" width="${size}" height="${size}" rx="${radius}" ry="${radius}"/></svg>`
+      );
+      const roundedBuf = await sharp(imageBuf)
+        .resize(size, size)
+        .composite([{ input: roundedCornersSvg, blend: 'dest-in' }])
+        .png()
+        .toBuffer();
+
+      const created = await app.emojis.create({
+        attachment: roundedBuf,
+        name: emojiName,
+      });
+
+      if (created) {
+        this.playerEmojiCache.set(cacheKey, `<:${created.name}:${created.id}>`);
+      }
+    } catch (err: any) {
+      if (err?.code === 30008 || err?.status === 403) {
+        this.canCreateApplicationEmojis = false;
+      }
+    }
+  }
+
   // Build real-time server status diagnostics embed
+  // Shows small player heads for players, NO big player head thumbnail!
   private buildStatusEmbed(serverAddress: string, state: any, live: any): EmbedBuilder {
     const canonicalAddr = serverStorage.getCanonicalServerAddress(serverAddress);
     const isOnline = state.status === 'online' || live?.online;
@@ -396,8 +423,41 @@ export class DiscordBotService {
     if (state.software || live?.version) {
       embed.addFields({
         name: 'Version & Software',
-        value: `${state.software || 'Paper'} ${live?.version || state.version || '1.20.4'}`,
+        value: `${state.software || 'Fabric'} ${live?.version || state.version || '1.20.4'}`,
         inline: true,
+      });
+    }
+
+    // Active players list with small player heads (NO big thumbnail)
+    const playerNames: string[] = [];
+    if (Array.isArray(live?.players?.list)) {
+      for (const p of live.players.list) {
+        if (p?.name && !playerNames.includes(p.name)) playerNames.push(p.name);
+      }
+    }
+    if (Array.isArray(state.playerList)) {
+      for (const name of state.playerList) {
+        if (name && !playerNames.includes(name)) playerNames.push(name);
+      }
+    }
+
+    if (playerNames.length > 0) {
+      const playerListItems = playerNames.map(n => {
+        const head = this.getPlayerHeadEmoji(n);
+        return `${head} **${n}**`;
+      });
+      embed.addFields({
+        name: `👤 Connected Players (${playerNames.length})`,
+        value: playerListItems.join('  •  '),
+        inline: false,
+      });
+    }
+
+    if (state.motd || live?.motd) {
+      embed.addFields({
+        name: '📜 MOTD',
+        value: `*${state.motd || live?.motd}*`,
+        inline: false,
       });
     }
 
@@ -411,7 +471,7 @@ export class DiscordBotService {
 
         embed.addFields({
           name: '⏱️ Keepalive Timer',
-          value: `\`${formatted}\` remaining • Auto-shutdown <t:${targetEpoch}:R>\n*(Updated live like in Aternos dashboard)*`,
+          value: `\`${formatted}\` remaining • Auto-shutdown <t:${targetEpoch}:R>\n*(Synced with Aternos dashboard)*`,
           inline: false,
         });
       } else {
@@ -423,197 +483,88 @@ export class DiscordBotService {
       }
     }
 
+    // Set bot icon only in footer (NO big thumbnail)
     embed.setFooter({ text: 'Aternos Command Center', iconURL: this.client.user?.displayAvatarURL() });
     embed.setTimestamp();
 
     return embed;
   }
 
-  // Start real-time live ticker editing status message smoothly every 1.5 seconds like in Aternos dashboard
-  private startStatusLiveTicker(
-    key: string,
-    serverAddress: string,
-    target: ChatInputCommandInteraction | Message
-  ) {
-    if (this.activeTickers.has(key)) {
-      this.activeTickers.get(key)!.stop();
+  // Fast resolution of fresh Aternos + Minecraft live status with concurrency protection
+  private async getFastServerState(serverAddress: string, sessionCookie?: string) {
+    let state: AternosState = aternosService.getState(serverAddress);
+
+    // Sync from Aternos if offline or older than 3.5s, with strict 2500ms max timeout so Discord never lags
+    if (sessionCookie && (state.status === 'offline' || Date.now() - state.lastUpdated > 3500)) {
+      try {
+        const syncTimeout = new Promise<AternosState>(resolve => setTimeout(() => resolve(state), 2500));
+        state = await Promise.race([aternosService.syncSessionState(serverAddress), syncTimeout]);
+      } catch {}
     }
 
-    let isUpdating = false;
-    let lastFormatted = '';
-    const startTime = Date.now();
-    let tickCount = 0;
-    const canonicalAddr = serverStorage.getCanonicalServerAddress(serverAddress);
+    const live = await queryMinecraftServer(
+      serverAddress,
+      state.dynip,
+      state.playersOnline || 0,
+      state.playerList || [],
+      state.status === 'online' || state.status === 'starting'
+    );
 
-    const interval = setInterval(async () => {
-      // Auto-stop after 10 minutes (Discord interaction tokens expire after 15 minutes)
-      if (Date.now() - startTime > 10 * 60 * 1000) {
-        clearInterval(interval);
-        this.activeTickers.delete(key);
-        return;
-      }
+    return { state, live };
+  }
 
-      if (isUpdating) return;
-      isUpdating = true;
-      tickCount++;
-
-      try {
-        const state = aternosService.getState(canonicalAddr);
-
-        // Periodically verify live ping every 15 seconds without stalling the ticker
-        let live: any = null;
-        if (tickCount % 10 === 0) {
-          live = await queryMinecraftServer(canonicalAddr, state.dynip, state.playersOnline || 0);
-        }
-
-        const isOnline = state.status === 'online' || (live && live.online);
-        const count = Math.max(live?.players?.online || 0, state.playersOnline || 0);
-
-        // If server stopped or players joined, perform one final update and stop ticker
-        if (!isOnline || count > 0) {
-          const finalEmbed = this.buildStatusEmbed(canonicalAddr, state, live);
-          if ('editReply' in target) {
-            await target.editReply({ embeds: [finalEmbed] });
-          } else {
-            await target.edit({ embeds: [finalEmbed] });
+  // Clean up previous bot messages for the user so each new command replaces the old message
+  private async deleteUserPreviousMessages(userId: string, currentInteraction: ChatInputCommandInteraction) {
+    // 1. Delete previous interaction reply for this user (both ephemeral and public)
+    const prevList = this.userLastInteractions.get(userId) || [];
+    for (const item of prevList) {
+      if (item.interaction && item.interaction.id !== currentInteraction.id) {
+        try {
+          if (Date.now() - item.timestamp < 14 * 60 * 1000) {
+            await item.interaction.deleteReply().catch(() => {});
           }
-          clearInterval(interval);
-          this.activeTickers.delete(key);
-          return;
-        }
-
-        const currentFormatted = state.countdownFormatted || '';
-        if (currentFormatted === lastFormatted && state.countdownSeconds !== null && tickCount % 10 !== 0) {
-          isUpdating = false;
-          return;
-        }
-        lastFormatted = currentFormatted;
-
-        const embed = this.buildStatusEmbed(canonicalAddr, state, live);
-
-        if ('editReply' in target) {
-          await target.editReply({ embeds: [embed] });
-        } else {
-          await target.edit({ embeds: [embed] });
-        }
-      } catch (err: any) {
-        if (err?.code === 10008 || err?.code === 10015 || err?.code === 10062) {
-          clearInterval(interval);
-          this.activeTickers.delete(key);
-        }
-      } finally {
-        isUpdating = false;
+        } catch {}
       }
-    }, 1500);
-
-    this.activeTickers.set(key, {
-      interval,
-      stop: () => {
-        clearInterval(interval);
-        this.activeTickers.delete(key);
-      },
-    });
-  }
-
-  // Start real-time live ticker for /players when 0 players are on
-  private startPlayersLiveTicker(
-    key: string,
-    serverAddress: string,
-    target: ChatInputCommandInteraction | Message,
-    max: number
-  ) {
-    if (this.activeTickers.has(key)) {
-      this.activeTickers.get(key)!.stop();
     }
 
-    let isUpdating = false;
-    let lastFormatted = '';
-    const startTime = Date.now();
-    const canonicalAddr = serverStorage.getCanonicalServerAddress(serverAddress);
+    // Retain only the current interaction for this user
+    this.userLastInteractions.set(userId, [
+      { interaction: currentInteraction, timestamp: Date.now() },
+    ]);
 
-    const interval = setInterval(async () => {
-      if (Date.now() - startTime > 10 * 60 * 1000) {
-        clearInterval(interval);
-        this.activeTickers.delete(key);
-        return;
+    // 2. Also check if there are any lingering public messages sent by the bot in this channel and delete them
+    try {
+      const channel = currentInteraction.channel;
+      if (channel && 'messages' in channel && typeof (channel as any).messages?.fetch === 'function') {
+        const fetched = await (channel as any).messages.fetch({ limit: 10 }).catch(() => null);
+        if (fetched) {
+          const botMessages = fetched.filter((m: any) => m.author?.id === this.client.user?.id);
+          for (const [, msg] of botMessages) {
+            await msg.delete().catch(() => {});
+          }
+        }
       }
-
-      if (isUpdating) return;
-      isUpdating = true;
-
-      try {
-        const state = aternosService.getState(canonicalAddr);
-        const count = state.playersOnline || 0;
-
-        if (state.status !== 'online' || count > 0) {
-          clearInterval(interval);
-          this.activeTickers.delete(key);
-          return;
-        }
-
-        const currentFormatted = state.countdownFormatted || '';
-        if (currentFormatted === lastFormatted && state.countdownSeconds !== null) {
-          isUpdating = false;
-          return;
-        }
-        lastFormatted = currentFormatted;
-
-        const secs = state.countdownSeconds ?? 360;
-        const mins = Math.floor(secs / 60);
-        const s = secs % 60;
-        const formatted = state.countdownFormatted || `${mins}:${s < 10 ? '0' : ''}${s}`;
-        const targetEpoch = Math.floor(Date.now() / 1000) + secs;
-
-        const embed = new EmbedBuilder()
-          .setColor(0x71717a)
-          .setTitle(`👥 No Players Online (0/${max})`)
-          .setDescription(`There are currently 0 players connected to **${canonicalAddr}**.\nThe world is quiet and waiting for players to join.`)
-          .addFields({
-            name: '⏱️ Keepalive Timer',
-            value: `\`${formatted}\` remaining • Auto-shutdown <t:${targetEpoch}:R>\n*(Updated live like in Aternos dashboard)*`,
-            inline: false,
-          })
-          .setFooter({ text: 'Aternos Command Center', iconURL: this.client.user?.displayAvatarURL() })
-          .setTimestamp();
-
-        if ('editReply' in target) {
-          await target.editReply({ embeds: [embed] });
-        } else {
-          await target.edit({ embeds: [embed] });
-        }
-      } catch (err: any) {
-        if (err?.code === 10008 || err?.code === 10015 || err?.code === 10062) {
-          clearInterval(interval);
-          this.activeTickers.delete(key);
-        }
-      } finally {
-        isUpdating = false;
-      }
-    }, 1500);
-
-    this.activeTickers.set(key, {
-      interval,
-      stop: () => {
-        clearInterval(interval);
-        this.activeTickers.delete(key);
-      },
-    });
+    } catch {}
   }
 
-  // Handle Slash Command
+  // Handle Slash Command with complete concurrency and rate limit protection
   private async handleSlashCommand(interaction: ChatInputCommandInteraction) {
-    const { commandName, user, guildId, channelId, channel } = interaction;
+    const { commandName, user, guildId, channelId } = interaction;
     const contextId = guildId || channelId || user.id;
 
-    await this.clearPreviousBotMessages(user.id, channel);
-
+    // Immediately defer interaction with ephemeral: true so ALL messages the bot sends
+    // are sent privately to the user who invoked the command ("Only you can see this").
     try {
-      await interaction.deferReply({ ephemeral: true });
-    } catch {
+      if (!interaction.deferred && !interaction.replied) {
+        await interaction.deferReply({ ephemeral: true });
+      }
+    } catch (err: any) {
+      console.warn(`[Discord] Could not defer /${commandName}:`, err?.message);
       return;
     }
 
-    this.lastUserInteractions.set(user.id, interaction);
+    // Automatically delete the previous message the bot sent to this user so old messages don't stack up
+    await this.deleteUserPreviousMessages(user.id, interaction);
 
     try {
       switch (commandName) {
@@ -624,46 +575,11 @@ export class DiscordBotService {
             .replace(/;.*$/, '')
             .replace(/^["']|["']$/g, '')
             .trim();
-          const serverInput = interaction.options.getString('server')?.trim();
 
-          // Discover available servers from this session
           const discovered: DiscoveredServer[] = await aternosService.discoverServersFromSession(session);
 
-          // If user provided a server input, try to match or fallback to canonical address
-          let matchedServer: DiscoveredServer | undefined = undefined;
-          let wasInputWrong = false;
-
-          const norm = (s: string) => s.toLowerCase().replace(/[-_\s]/g, '').replace(/\.aternos\.me$/i, '');
-
-          if (serverInput) {
-            const inputNorm = norm(serverInput);
-            matchedServer = discovered.find(
-              s =>
-                s.id.toLowerCase() === serverInput.toLowerCase() ||
-                s.serverCookie.toLowerCase() === serverInput.toLowerCase() ||
-                s.serverAddress.toLowerCase() === serverInput.toLowerCase() ||
-                s.name.toLowerCase() === serverInput.toLowerCase() ||
-                norm(s.serverAddress) === inputNorm ||
-                norm(s.name) === inputNorm ||
-                norm(s.id) === inputNorm
-            );
-
-            if (!matchedServer) {
-              const canonical = serverStorage.getCanonicalServerAddress(serverInput);
-              const existingProfile = serverStorage.getProfile(serverInput);
-              matchedServer = {
-                id: existingProfile?.serverCookie || existingProfile?.id || canonical.replace(/[^a-zA-Z0-9]/g, '-').toLowerCase(),
-                name: canonical,
-                serverAddress: canonical,
-                serverCookie: existingProfile?.serverCookie || 'C97GPgj1GU2y7wWc',
-              };
-            }
-          } else if (discovered.length === 1) {
-            matchedServer = discovered[0];
-          }
-
-          // Case 1: Match found with provided server ID / address
-          if (matchedServer) {
+          if (discovered.length === 1) {
+            const matchedServer = discovered[0];
             const canonicalAddr = serverStorage.getCanonicalServerAddress(matchedServer.serverAddress);
             serverStorage.setDiscordBinding({
               guildIdOrUserId: contextId,
@@ -755,13 +671,9 @@ export class DiscordBotService {
           const actionRow = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(selectMenu);
 
           const embed = new EmbedBuilder()
-            .setColor(wasInputWrong ? 0xf59e0b : 0x3b82f6)
-            .setTitle(wasInputWrong ? '⚠️ Server ID Not Found — Choose From Available Servers' : '📋 Choose Your Aternos Server')
-            .setDescription(
-              wasInputWrong
-                ? `The server ID \`${serverInput}\` was not recognized on your account.\n\nFound **${discovered.length} server(s)** linked to your session. Select the server you want to control from the dropdown below:`
-                : `Found **${discovered.length} server(s)** linked to your session account. Select the server you want to control from the dropdown below:`
-            )
+            .setColor(0x3b82f6)
+            .setTitle('📋 Choose Your Aternos Server')
+            .setDescription(`Found **${discovered.length} server(s)** linked to your session. Select the server you want to control from the dropdown below:`)
             .addFields(
               discovered.map((s, idx) => ({
                 name: `${idx + 1}. ${s.serverAddress}`,
@@ -777,13 +689,7 @@ export class DiscordBotService {
 
         case 'start': {
           const ctx = this.resolveServerContext(contextId, user.id);
-          let state = aternosService.getState(ctx.serverAddress);
-          if (ctx.sessionCookie && (state.status === 'offline' || Date.now() - state.lastUpdated > 8000)) {
-            try {
-              state = await aternosService.syncSessionState(ctx.serverAddress);
-            } catch {}
-          }
-          const live = await queryMinecraftServer(ctx.serverAddress, state.dynip, state.playersOnline || 0);
+          const { state, live } = await this.getFastServerState(ctx.serverAddress, ctx.sessionCookie);
 
           if (state.status === 'online' || live.online) {
             const embed = new EmbedBuilder()
@@ -847,13 +753,7 @@ export class DiscordBotService {
 
         case 'stop': {
           const ctx = this.resolveServerContext(contextId, user.id);
-          let state = aternosService.getState(ctx.serverAddress);
-          if (ctx.sessionCookie && (state.status === 'online' || Date.now() - state.lastUpdated > 8000)) {
-            try {
-              state = await aternosService.syncSessionState(ctx.serverAddress);
-            } catch {}
-          }
-          const live = await queryMinecraftServer(ctx.serverAddress, state.dynip, state.playersOnline || 0);
+          const { state, live } = await this.getFastServerState(ctx.serverAddress, ctx.sessionCookie);
 
           if (state.status === 'offline' && !live.online) {
             const embed = new EmbedBuilder()
@@ -927,38 +827,20 @@ export class DiscordBotService {
 
         case 'status': {
           const ctx = this.resolveServerContext(contextId, user.id);
-          // Always ensure fresh state from Aternos first so we never report offline when server is running
-          let state = aternosService.getState(ctx.serverAddress);
-          if (ctx.sessionCookie || state.status === 'offline' || Date.now() - state.lastUpdated > 8000) {
-            try {
-              state = await aternosService.syncSessionState(ctx.serverAddress);
-            } catch {}
-          }
-          const live = await queryMinecraftServer(ctx.serverAddress, state.dynip, state.playersOnline || 0);
+          const { state, live } = await this.getFastServerState(ctx.serverAddress, ctx.sessionCookie);
 
           const embed = this.buildStatusEmbed(ctx.serverAddress, state, live);
           await interaction.editReply({ embeds: [embed] });
-
-          const isOnline = state.status === 'online' || live.online;
-          const playerCount = Math.max(live.players?.online || 0, state.playersOnline || 0);
-          if (isOnline && playerCount === 0) {
-            this.startStatusLiveTicker(user.id, ctx.serverAddress, interaction);
-          }
           break;
         }
 
         case 'players': {
           const ctx = this.resolveServerContext(contextId, user.id);
-          // Always sync state from Aternos immediately so we don't think it's offline
-          let state = aternosService.getState(ctx.serverAddress);
-          if (ctx.sessionCookie || state.status === 'offline' || Date.now() - state.lastUpdated > 8000) {
-            try {
-              state = await aternosService.syncSessionState(ctx.serverAddress);
-            } catch {}
-          }
-          const live = await queryMinecraftServer(ctx.serverAddress, state.dynip, state.playersOnline || 0);
+          const { state, live } = await this.getFastServerState(ctx.serverAddress, ctx.sessionCookie);
 
-          if (!live.online && state.status !== 'online' && state.status !== 'starting') {
+          const isOnline = live.online || state.status === 'online' || state.status === 'starting';
+
+          if (!isOnline) {
             const embed = new EmbedBuilder()
               .setColor(0xef4444)
               .setTitle('🔴 Server is Offline')
@@ -967,17 +849,26 @@ export class DiscordBotService {
             return;
           }
 
-          const count = Math.max(live.players?.online || 0, state.playersOnline || 0);
-          const max = live.players?.max || state.maxPlayers || 20;
-          const playerList = live.players?.list || [];
+          // Combine unique players from live SLP query and Aternos playerList
+          const playerNames = new Set<string>();
+          for (const p of (live.players?.list || [])) {
+            if (p?.name) playerNames.add(p.name);
+          }
+          for (const name of (state.playerList || [])) {
+            if (name) playerNames.add(name);
+          }
 
-          if (count === 0 && playerList.length === 0) {
+          const combinedList = Array.from(playerNames);
+          const count = Math.max(combinedList.length, live.players?.online || 0, state.playersOnline || 0);
+          const max = live.players?.max || state.maxPlayers || 20;
+
+          if (count === 0 && combinedList.length === 0) {
             const embed = new EmbedBuilder()
               .setColor(0x71717a)
               .setTitle(`👥 No Players Online (0/${max})`)
               .setDescription(`There are currently 0 players connected to **${ctx.serverAddress}**.\nThe world is quiet and waiting for players to join.`);
 
-            if (state.status === 'online' || live.online) {
+            if (isOnline) {
               const secs = state.countdownSeconds ?? 360;
               const mins = Math.floor(secs / 60);
               const s = secs % 60;
@@ -986,7 +877,7 @@ export class DiscordBotService {
 
               embed.addFields({
                 name: '⏱️ Keepalive Timer',
-                value: `\`${formatted}\` remaining • Auto-shutdown <t:${targetEpoch}:R>\n*(Updated live like in Aternos dashboard)*`,
+                value: `\`${formatted}\` remaining • Auto-shutdown <t:${targetEpoch}:R>\n*(Synced with Aternos dashboard)*`,
                 inline: false,
               });
             }
@@ -995,10 +886,6 @@ export class DiscordBotService {
             embed.setTimestamp();
 
             await interaction.editReply({ embeds: [embed] });
-
-            if (state.status === 'online' || live.online) {
-              this.startPlayersLiveTicker(user.id, ctx.serverAddress, interaction, max);
-            }
             return;
           }
 
@@ -1008,16 +895,13 @@ export class DiscordBotService {
             .setDescription(`Active players currently connected to **${ctx.serverAddress}**:`)
             .setTimestamp();
 
-          if (playerList.length > 0) {
-            const playerLines = await Promise.all(
-              playerList.map(async (p, idx) => {
-                const headEmoji = await this.getPlayerHeadEmoji(p.name);
-                return `**${idx + 1}.** ${headEmoji} **${p.name}**`;
-              })
-            );
-
-            // Double newline spacing between players as requested
-            embed.addFields({ name: 'Connected Players', value: playerLines.join('\n\n'), inline: false });
+          if (combinedList.length > 0) {
+            // Render clean player lines with small player heads, NO skin links, NO big head thumbnail
+            const playerLines = combinedList.map((name, idx) => {
+              const headEmoji = this.getPlayerHeadEmoji(name);
+              return `**${idx + 1}.** ${headEmoji} **${name}**`;
+            });
+            embed.addFields({ name: 'Connected Players', value: playerLines.join('\n'), inline: false });
           } else {
             embed.setDescription(`There ${count === 1 ? 'is' : 'are'} currently **${count}** player${count > 1 ? 's' : ''} connected to the server.`);
           }
@@ -1035,9 +919,17 @@ export class DiscordBotService {
           await interaction.editReply({ content: 'Unknown command.' });
       }
     } catch (err: any) {
+      // If error is because the message was already deleted (e.g. replaced by newer command), ignore silently
+      if (err?.code === 10008 || err?.message?.includes('Unknown Message')) {
+        return;
+      }
       console.error(`[Discord /${commandName} Error]`, err);
       try {
-        await interaction.editReply({ content: `❌ Command Error: ${err.message || 'Operation failed'}` });
+        if (interaction.deferred && !interaction.replied) {
+          await interaction.editReply({ content: `❌ Command Error: ${err.message || 'Operation failed'}` });
+        } else if (!interaction.replied) {
+          await interaction.reply({ content: `❌ Command Error: ${err.message || 'Operation failed'}`, ephemeral: true });
+        }
       } catch {}
     }
   }
@@ -1124,175 +1016,13 @@ export class DiscordBotService {
       // Update interaction with no more dropdown components
       await interaction.editReply({ embeds: [embed], components: [] });
       this.pendingSelections.delete(customId);
+
+      // Track completed selection interaction so subsequent command replaces/deletes it
+      this.userLastInteractions.set(user.id, [
+        { interaction, timestamp: Date.now() },
+      ]);
     } catch (err: any) {
       console.error('[Select Menu Error]', err);
-    }
-  }
-
-  // Handle Text Fallbacks (!status, !players, !start, !stop, etc.)
-  private async handleMessageFallback(message: Message) {
-    const content = message.content.trim();
-    if (!content.startsWith('!') && !content.startsWith('/')) return;
-
-    const parts = content.slice(1).split(/\s+/);
-    const cmd = parts[0]?.toLowerCase();
-    const args = parts.slice(1);
-    const contextId = message.guildId || message.channelId || message.author.id;
-    const userId = message.author.id;
-
-    await this.clearPreviousBotMessages(userId, message.channel);
-
-    try {
-      await message.delete();
-    } catch {}
-
-    const ctx = this.resolveServerContext(contextId, userId);
-
-    if (cmd === 'status') {
-      let state = aternosService.getState(ctx.serverAddress);
-      if (ctx.sessionCookie || state.status === 'offline' || Date.now() - state.lastUpdated > 8000) {
-        try {
-          state = await aternosService.syncSessionState(ctx.serverAddress);
-        } catch {}
-      }
-      const live = await queryMinecraftServer(ctx.serverAddress, state.dynip, state.playersOnline || 0);
-
-      const embed = this.buildStatusEmbed(ctx.serverAddress, state, live);
-      const reply = await message.reply({ embeds: [embed] });
-      this.lastUserMessages.set(userId, reply);
-
-      const isOnline = state.status === 'online' || live?.online;
-      const count = Math.max(live?.players?.online || 0, state.playersOnline || 0);
-      if (isOnline && count === 0) {
-        this.startStatusLiveTicker(userId, ctx.serverAddress, reply);
-      }
-    } else if (cmd === 'players') {
-      let state = aternosService.getState(ctx.serverAddress);
-      if (ctx.sessionCookie || state.status === 'offline' || Date.now() - state.lastUpdated > 8000) {
-        try {
-          state = await aternosService.syncSessionState(ctx.serverAddress);
-        } catch {}
-      }
-      const live = await queryMinecraftServer(ctx.serverAddress, state.dynip, state.playersOnline || 0);
-
-      if (!live?.online && state.status !== 'online' && state.status !== 'starting') {
-        const reply = await message.reply({ content: `🔴 **Server is offline.** Cannot retrieve players for \`${ctx.serverAddress}\`.` });
-        this.lastUserMessages.set(userId, reply);
-        return;
-      }
-
-      const count = Math.max(live?.players?.online || 0, state.playersOnline || 0);
-      const max = live?.players?.max || state.maxPlayers || 20;
-      const playerList = live?.players?.list || [];
-
-      if (count === 0 && playerList.length === 0) {
-        const embed = new EmbedBuilder()
-          .setColor(0x71717a)
-          .setTitle(`👥 No Players Online (0/${max})`)
-          .setDescription(`There are currently 0 players connected to **${ctx.serverAddress}**.\nThe world is quiet and waiting for players to join.`);
-
-        if (state.status === 'online' || live?.online) {
-          const secs = state.countdownSeconds ?? 360;
-          const mins = Math.floor(secs / 60);
-          const s = secs % 60;
-          const formatted = state.countdownFormatted || `${mins}:${s < 10 ? '0' : ''}${s}`;
-          const targetEpoch = Math.floor(Date.now() / 1000) + secs;
-
-          embed.addFields({
-            name: '⏱️ Keepalive Timer',
-            value: `\`${formatted}\` remaining • Auto-shutdown <t:${targetEpoch}:R>\n*(Updated live like in Aternos dashboard)*`,
-            inline: false,
-          });
-        }
-
-        embed.setFooter({ text: 'Aternos Command Center', iconURL: this.client.user?.displayAvatarURL() });
-        embed.setTimestamp();
-
-        const reply = await message.reply({ embeds: [embed] });
-        this.lastUserMessages.set(userId, reply);
-
-        if (state.status === 'online' || live?.online) {
-          this.startPlayersLiveTicker(userId, ctx.serverAddress, reply, max);
-        }
-        return;
-      }
-
-      const embed = new EmbedBuilder()
-        .setColor(0x10b981)
-        .setTitle(`👥 Online Players (${count}/${max})`)
-        .setDescription(`Active players currently on **${ctx.serverAddress}**:`)
-        .setTimestamp();
-
-      if (playerList.length > 0) {
-        const playerLines = await Promise.all(
-          playerList.map(async (p, idx) => {
-            const headEmoji = await this.getPlayerHeadEmoji(p.name);
-            return `**${idx + 1}.** ${headEmoji} **${p.name}**`;
-          })
-        );
-        // Double newline spacing between players as requested
-        embed.addFields({ name: 'Connected Players', value: playerLines.join('\n\n'), inline: false });
-      } else {
-        embed.setDescription(`**${count}** player${count > 1 ? 's' : ''} connected.`);
-      }
-
-      embed.setFooter({ text: 'Aternos Command Center', iconURL: this.client.user?.displayAvatarURL() });
-
-      const reply = await message.reply({ embeds: [embed] });
-      this.lastUserMessages.set(userId, reply);
-    } else if (cmd === 'start') {
-      let state = aternosService.getState(ctx.serverAddress);
-      if (ctx.sessionCookie && (state.status === 'offline' || Date.now() - state.lastUpdated > 8000)) {
-        try {
-          state = await aternosService.syncSessionState(ctx.serverAddress);
-        } catch {}
-      }
-      const live = await queryMinecraftServer(ctx.serverAddress, state.dynip, state.playersOnline || 0);
-
-      if (state.status === 'online' || live.online) {
-        const reply = await message.reply({
-          content: `⚠️ **Server is already Online!** \`${ctx.serverAddress}\` is running and ready for players.`,
-        });
-        this.lastUserMessages.set(userId, reply);
-        return;
-      }
-
-      const res = await aternosService.startServer(ctx.serverAddress, {
-        sessionCookie: ctx.sessionCookie,
-        serverCookie: ctx.serverCookie,
-        serverAddress: ctx.serverAddress,
-      });
-
-      const reply = await message.reply({
-        content: res.success
-          ? `🚀 **Server Boot Initiated!** Startup sequence dispatched for \`${ctx.serverAddress}\` (~1-2 mins).`
-          : `❌ **Failed to start server:** ${res.message}`,
-      });
-      this.lastUserMessages.set(userId, reply);
-    } else if (cmd === 'stop') {
-      const state = aternosService.getState(ctx.serverAddress);
-      const live = await queryMinecraftServer(ctx.serverAddress, state.dynip, state.playersOnline || 0);
-
-      if (state.status === 'offline' && !live.online) {
-        const reply = await message.reply({
-          content: `⚠️ **Server is already Offline!** \`${ctx.serverAddress}\` is already turned off.`,
-        });
-        this.lastUserMessages.set(userId, reply);
-        return;
-      }
-
-      const res = await aternosService.stopServer(ctx.serverAddress, {
-        sessionCookie: ctx.sessionCookie,
-        serverCookie: ctx.serverCookie,
-        serverAddress: ctx.serverAddress,
-      });
-
-      const reply = await message.reply({
-        content: res.success
-          ? `🛑 **Server Shutdown Initiated!** Stop signal dispatched for \`${ctx.serverAddress}\`.`
-          : `❌ **Failed to stop server:** ${res.message}`,
-      });
-      this.lastUserMessages.set(userId, reply);
     }
   }
 

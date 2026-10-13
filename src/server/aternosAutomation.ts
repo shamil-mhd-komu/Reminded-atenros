@@ -86,7 +86,7 @@ export class AternosAutomationManager {
   private logsBuffer: LogEntry[] = [];
   private readonly MAX_LOGS = 120;
   private curlBinaryPath: string;
-
+  private inFlightSyncs: Map<string, Promise<AternosState>> = new Map();
   private macroRules: MacroRule[] = JSON.parse(JSON.stringify(DEFAULT_MACRO_RULES));
 
   constructor() {
@@ -258,11 +258,21 @@ export class AternosAutomationManager {
     if (!query) return this.getActiveInstance();
     const clean = query.trim().toLowerCase();
     if (this.sessions.has(clean)) return this.sessions.get(clean);
+    const normalize = (s: string) => s.toLowerCase().replace(/[-_\s]/g, '').replace(/\.aternos\.me$/i, '');
+    const cleanNorm = normalize(clean);
+
     for (const inst of this.sessions.values()) {
       if (
         (inst.id && inst.id.toLowerCase() === clean) ||
         (inst.config.serverAddress && inst.config.serverAddress.toLowerCase() === clean) ||
-        (inst.state.serverIp && inst.state.serverIp.toLowerCase() === clean)
+        (inst.state.serverIp && inst.state.serverIp.toLowerCase() === clean) ||
+        (inst.id && normalize(inst.id) === cleanNorm) ||
+        (inst.config.serverAddress && normalize(inst.config.serverAddress) === cleanNorm) ||
+        (inst.state.serverIp && normalize(inst.state.serverIp) === cleanNorm) ||
+        (cleanNorm.length >= 4 && (
+          (inst.config.serverAddress && normalize(inst.config.serverAddress).includes(cleanNorm)) ||
+          (inst.id && normalize(inst.id).includes(cleanNorm))
+        ))
       ) {
         return inst;
       }
@@ -724,8 +734,22 @@ export class AternosAutomationManager {
 
     if (lastStatus.slots !== undefined) inst.state.maxPlayers = Number(lastStatus.slots);
     if (lastStatus.players !== undefined) inst.state.playersOnline = Number(lastStatus.players);
+    if (Array.isArray(lastStatus.playerlist)) {
+      const parsedList = lastStatus.playerlist.map((p: any) => String(p).trim()).filter(Boolean);
+      inst.state.playerList = parsedList;
+      if (parsedList.length > 0 && (!inst.state.playersOnline || inst.state.playersOnline < parsedList.length)) {
+        inst.state.playersOnline = parsedList.length;
+      }
+    } else if (lastStatus.players === 0) {
+      inst.state.playerList = [];
+    }
+    if (lastStatus.motd) {
+      inst.state.motd = String(lastStatus.motd).replace(/§[0-9a-fk-or]/gi, '').trim();
+    }
     if (lastStatus.software) inst.state.software = lastStatus.software;
     if (lastStatus.version) inst.state.version = lastStatus.version;
+    if (lastStatus.port) inst.state.serverPort = String(lastStatus.port);
+    if (lastStatus.dynip) inst.state.dynip = lastStatus.dynip;
     const rawAddr = (lastStatus.ip && typeof lastStatus.ip === 'string' && lastStatus.ip.trim())
       ? lastStatus.ip.trim()
       : (lastStatus.name && typeof lastStatus.name === 'string' && lastStatus.name.trim()
@@ -741,29 +765,54 @@ export class AternosAutomationManager {
     const inst = this.findSessionInstance(key) || this.sessions.get(key);
     if (!inst) return this.getState();
 
-    // Query Aternos Server page directly via Chrome client
-    if (inst.config.sessionCookie) {
+    // Cache window: If updated less than 3.5 seconds ago, return cached state
+    if (Date.now() - inst.state.lastUpdated < 3500) {
+      return inst.state;
+    }
+
+    const normKey = (inst.config.serverAddress || key).toLowerCase();
+    const existingSync = this.inFlightSyncs.get(normKey);
+    if (existingSync) {
+      return existingSync;
+    }
+
+    const syncPromise = (async () => {
       try {
-        const secInfo = this.generateSecToken();
-        const cookies = [
-          `ATERNOS_SESSION=${inst.config.sessionCookie.trim()}`,
-          ...(inst.config.serverCookie ? [`ATERNOS_SERVER=${inst.config.serverCookie.trim()}`] : []),
-          `ATERNOS_SEC_${secInfo.key}=${secInfo.val}`,
-        ];
+        // Auto-resolve serverCookie if missing
+        if (!inst.config.serverCookie) {
+          const stored = serverStorage.getProfile(inst.config.serverAddress) || serverStorage.getProfile(key);
+          if (stored?.serverCookie) {
+            inst.config.serverCookie = stored.serverCookie;
+          }
+        }
 
-        const html = await this.executeChromeRequest('https://aternos.org/server/', cookies);
-        const lastStatus = this.extractLastStatus(html);
+        // Query Aternos Server page directly via Chrome client
+        if (inst.config.sessionCookie) {
+          const secInfo = this.generateSecToken();
+          const cookies = [
+            `ATERNOS_SESSION=${inst.config.sessionCookie.trim()}`,
+            ...(inst.config.serverCookie ? [`ATERNOS_SERVER=${inst.config.serverCookie.trim()}`] : []),
+            `ATERNOS_SEC_${secInfo.key}=${secInfo.val}`,
+          ];
 
-        if (lastStatus) {
-          this.applyLastStatus(inst, lastStatus);
+          const html = await this.executeChromeRequest('https://aternos.org/server/', cookies);
+          const lastStatus = this.extractLastStatus(html);
+
+          if (lastStatus) {
+            this.applyLastStatus(inst, lastStatus);
+          }
         }
       } catch {
         // network retry
+      } finally {
+        inst.state.lastUpdated = Date.now();
+        this.inFlightSyncs.delete(normKey);
       }
-    }
+      return inst.state;
+    })();
 
-    inst.state.lastUpdated = Date.now();
-    return inst.state;
+    this.inFlightSyncs.set(normKey, syncPromise);
+    return syncPromise;
   }
 
   // Start Server: Real Sleeyax AJAX API execution

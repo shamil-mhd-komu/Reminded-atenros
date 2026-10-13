@@ -1,6 +1,6 @@
 {
-  "name": "Remix Aternos-Ui",
-  "description": "Imported from GitHub: shamil-mhd-komu/Aternos-Ui",
+  "name": "Aternos Command Center",
+  "description": "Stealth monitoring, automation, and real-time control console for Aternos Minecraft servers.",
   "requestFramePermissions": [],
   "majorCapabilities": [
     "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"

@@ -192,20 +192,31 @@ export async function pingMinecraftDirect(host: string, port: number = 25565, ti
 
 // 10-second memory cache for instant responses
 const pingCache: Map<string, { time: number; result: PingResult }> = new Map();
+const inFlightPings: Map<string, Promise<PingResult>> = new Map();
 
-// Fast concurrent query querying direct TCP and HTTP APIs in parallel with 15s caching & anti-flapping
+// Fast concurrent query querying direct TCP and HTTP APIs in parallel with caching & accurate fallbacks
 export async function queryMinecraftServer(
   serverAddress: string,
   dynip?: string,
-  fallbackCount: number = 0
+  fallbackCount: number = 0,
+  fallbackPlayerList: string[] = [],
+  fallbackOnline: boolean = false
 ): Promise<PingResult> {
   const cacheKey = `${serverAddress}_${dynip || ''}`.toLowerCase();
   const cached = pingCache.get(cacheKey);
   const now = Date.now();
 
-  if (cached && now - cached.time < 12000) {
+  if (cached && now - cached.time < 6000) {
     return cached.result;
   }
+
+  const existingInFlight = inFlightPings.get(cacheKey);
+  if (existingInFlight) {
+    return existingInFlight;
+  }
+
+  const queryPromise = (async (): Promise<PingResult> => {
+    try {
 
   const parseAddress = (addr: string) => {
     const parts = addr.split(':');
@@ -219,12 +230,11 @@ export async function queryMinecraftServer(
   if (dynip && dynip.trim()) targets.push(parseAddress(dynip.trim()));
   if (serverAddress && serverAddress.trim()) targets.push(parseAddress(serverAddress.trim()));
 
-  // Run fast parallel checks: direct TCP + mcstatus.io (with 2500ms timeout)
   const tasks: Promise<PingResult | null>[] = [];
 
   // Direct TCP checks
   for (const t of targets) {
-    tasks.push(pingMinecraftDirect(t.host, t.port, 2500));
+    tasks.push(pingMinecraftDirect(t.host, t.port, 1500));
   }
 
   // Fast mcstatus.io fetch
@@ -234,7 +244,7 @@ export async function queryMinecraftServer(
       (async (): Promise<PingResult | null> => {
         try {
           const ac = new AbortController();
-          const tm = setTimeout(() => ac.abort(), 2500);
+          const tm = setTimeout(() => ac.abort(), 3000);
           const res = await fetch(`https://api.mcstatus.io/v2/status/java/${encodeURIComponent(targetStr)}`, {
             signal: ac.signal,
           });
@@ -242,23 +252,68 @@ export async function queryMinecraftServer(
           if (res.ok) {
             const data = await res.json();
             if (data?.online) {
-              const list: PingPlayer[] = Array.isArray(data.players?.list)
-                ? data.players.list.map((p: any) => ({
-                    name: p.name_clean || p.name_raw || p.name,
-                    uuid: p.uuid,
-                    avatarUrl: `https://minotar.net/helm/${encodeURIComponent(p.name_clean || p.name_raw || p.name)}/32.png`,
-                  }))
-                : [];
+              const rawList = Array.isArray(data.players?.list) ? data.players.list : [];
+              const list: PingPlayer[] = rawList.map((p: any) => {
+                const name = typeof p === 'string' ? p : p.name_clean || p.name_raw || p.name || '';
+                return {
+                  name,
+                  uuid: typeof p === 'object' ? p.uuid : undefined,
+                  avatarUrl: `https://minotar.net/helm/${encodeURIComponent(name)}/32.png`,
+                };
+              }).filter((p: PingPlayer) => Boolean(p.name));
 
               return {
                 online: true,
                 players: {
-                  online: data.players?.online || 0,
+                  online: data.players?.online ?? list.length,
                   max: data.players?.max || 20,
                   list,
                 },
-                version: data.version?.name_clean,
+                version: data.version?.name_clean || data.version?.name_raw,
                 motd: data.motd?.clean,
+              };
+            }
+          }
+        } catch {}
+        return null;
+      })()
+    );
+  }
+
+  // Fast mcsrvstat.us fetch
+  for (const t of targets) {
+    const targetStr = t.port === 25565 ? t.host : `${t.host}:${t.port}`;
+    tasks.push(
+      (async (): Promise<PingResult | null> => {
+        try {
+          const ac = new AbortController();
+          const tm = setTimeout(() => ac.abort(), 3000);
+          const res = await fetch(`https://api.mcsrvstat.us/3/${encodeURIComponent(targetStr)}`, {
+            signal: ac.signal,
+          });
+          clearTimeout(tm);
+          if (res.ok) {
+            const data = await res.json();
+            if (data?.online) {
+              const rawList = Array.isArray(data.players?.list) ? data.players.list : [];
+              const list: PingPlayer[] = rawList.map((p: any) => {
+                const name = typeof p === 'string' ? p : p.name || p.name_clean || '';
+                return {
+                  name,
+                  uuid: typeof p === 'object' ? p.uuid : undefined,
+                  avatarUrl: `https://minotar.net/helm/${encodeURIComponent(name)}/32.png`,
+                };
+              }).filter((p: PingPlayer) => Boolean(p.name));
+
+              return {
+                online: true,
+                players: {
+                  online: data.players?.online ?? list.length,
+                  max: data.players?.max || 20,
+                  list,
+                },
+                version: data.version,
+                motd: Array.isArray(data.motd?.clean) ? data.motd.clean.join(' ') : data.motd?.clean,
               };
             }
           }
@@ -273,25 +328,44 @@ export async function queryMinecraftServer(
     const results = await Promise.all(tasks);
     const onlineResult = results.find(r => r && r.online);
     if (onlineResult) {
+      // Merge in any fallback players known from Aternos console that might not appear in sample
+      const existingNames = new Set(onlineResult.players.list.map(p => p.name.toLowerCase()));
+      for (const name of fallbackPlayerList) {
+        if (name && !existingNames.has(name.toLowerCase())) {
+          onlineResult.players.list.push({
+            name,
+            avatarUrl: `https://minotar.net/helm/${encodeURIComponent(name)}/32.png`,
+          });
+        }
+      }
+      onlineResult.players.online = Math.max(onlineResult.players.online, onlineResult.players.list.length, fallbackCount);
       pingCache.set(cacheKey, { time: now, result: onlineResult });
       return onlineResult;
     }
   } catch {}
 
-  // Anti-flapping grace period: If server was verified online within the last 25 seconds, don't flap to offline on a single transient timeout
-  if (cached && cached.result.online && now - cached.time < 25000) {
-    return cached.result;
-  }
+  // Accurate Fallback using Aternos internal state
+  const isServerOnline = fallbackOnline || fallbackCount > 0 || fallbackPlayerList.length > 0;
+  const listFromFallback: PingPlayer[] = fallbackPlayerList.map(name => ({
+    name,
+    avatarUrl: `https://minotar.net/helm/${encodeURIComponent(name)}/32.png`,
+  }));
 
-  // Fallback using Aternos internal state
-  const fallbackResult: PingResult = {
-    online: fallbackCount > 0,
-    players: {
-      online: fallbackCount,
-      max: 20,
-      list: [],
-    },
-  };
-  pingCache.set(cacheKey, { time: now, result: fallbackResult });
-  return fallbackResult;
+      const fallbackResult: PingResult = {
+        online: isServerOnline,
+        players: {
+          online: Math.max(fallbackCount, listFromFallback.length),
+          max: 20,
+          list: listFromFallback,
+        },
+      };
+      pingCache.set(cacheKey, { time: now, result: fallbackResult });
+      return fallbackResult;
+    } finally {
+      inFlightPings.delete(cacheKey);
+    }
+  })();
+
+  inFlightPings.set(cacheKey, queryPromise);
+  return queryPromise;
 }
