@@ -34,10 +34,12 @@ class ServerStorageManager {
   private storageFilePath: string;
   private discordBindingsPath: string;
   private discordLogsPath: string;
+  private botModePath: string;
 
   private profiles: Map<string, StoredServerProfile> = new Map();
   private discordBindings: Map<string, DiscordServerBinding> = new Map();
   private discordLogs: DiscordActivityLog[] = [];
+  private botTarget: 'dev' | 'published' | 'disabled' = 'dev';
   private readonly MAX_LOGS = 100;
 
   constructor() {
@@ -45,6 +47,7 @@ class ServerStorageManager {
     this.storageFilePath = path.join(this.dataDir, 'admin-servers.json');
     this.discordBindingsPath = path.join(this.dataDir, 'discord-bindings.json');
     this.discordLogsPath = path.join(this.dataDir, 'discord-logs.json');
+    this.botModePath = path.join(this.dataDir, 'bot-mode.json');
 
     this.ensureDataDir();
     this.loadFromDisk();
@@ -104,6 +107,15 @@ class ServerStorageManager {
         const list: DiscordActivityLog[] = JSON.parse(raw);
         if (Array.isArray(list)) {
           this.discordLogs = list;
+        }
+      }
+
+      // 4. Load bot active target
+      if (fs.existsSync(this.botModePath)) {
+        const raw = fs.readFileSync(this.botModePath, 'utf-8');
+        const parsed = JSON.parse(raw);
+        if (parsed?.activeTarget === 'dev' || parsed?.activeTarget === 'published' || parsed?.activeTarget === 'disabled') {
+          this.botTarget = parsed.activeTarget;
         }
       }
     } catch {}
@@ -302,6 +314,33 @@ class ServerStorageManager {
 
   public getDiscordLogs(): DiscordActivityLog[] {
     return [...this.discordLogs];
+  }
+
+  // Discord Bot Active Instance Target ('dev' | 'published' | 'disabled')
+  public getBotTarget(): 'dev' | 'published' | 'disabled' {
+    return this.botTarget;
+  }
+
+  public setBotTarget(target: 'dev' | 'published' | 'disabled', updatedBy: string = 'Admin'): void {
+    this.botTarget = target;
+    try {
+      this.ensureDataDir();
+      fs.writeFileSync(
+        this.botModePath,
+        JSON.stringify(
+          {
+            activeTarget: target,
+            updatedAt: Date.now(),
+            updatedBy,
+          },
+          null,
+          2
+        ),
+        'utf-8'
+      );
+    } catch (err: any) {
+      console.warn('Could not save bot mode to disk:', err?.message);
+    }
   }
 }
 

@@ -1,6 +1,51 @@
 [
   {
     "user": "Aternos#3859",
+    "command": "STOP",
+    "serverAddress": "discord.gateway",
+    "status": "warning",
+    "message": "Bot stopped on dev",
+    "id": "1791979226126-heub",
+    "timestamp": "12:00:26"
+  },
+  {
+    "user": "Aternos#3859",
+    "command": "READY",
+    "serverAddress": "discord.gateway",
+    "status": "success",
+    "message": "Connected in 1 server(s) [DEV]",
+    "id": "1791979212110-mve9",
+    "timestamp": "12:00:12"
+  },
+  {
+    "user": "fliesh_yy4831",
+    "command": "/configure [SELECT]",
+    "serverAddress": "Bang_Bros_SMP.aternos.me",
+    "status": "success",
+    "message": "Selected and bound Bang_Bros_SMP.aternos.me",
+    "id": "1791978613960-k6ld",
+    "timestamp": "11:50:13"
+  },
+  {
+    "user": "Aternos#3859",
+    "command": "READY",
+    "serverAddress": "discord.gateway",
+    "status": "success",
+    "message": "Connected in 1 server(s)",
+    "id": "1791978206270-lwm0",
+    "timestamp": "11:43:26"
+  },
+  {
+    "user": "Aternos#3859",
+    "command": "READY",
+    "serverAddress": "discord.gateway",
+    "status": "success",
+    "message": "Connected in 1 server(s)",
+    "id": "1791978065278-6w2q",
+    "timestamp": "11:41:05"
+  },
+  {
+    "user": "Aternos#3859",
     "command": "READY",
     "serverAddress": "discord.gateway",
     "status": "success",

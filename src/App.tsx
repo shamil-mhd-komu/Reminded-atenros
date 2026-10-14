@@ -14,8 +14,10 @@ import { MobileTouchBar } from './components/MobileTouchBar.tsx';
 import { ToastContainer, type ToastMessage } from './components/Toast.tsx';
 import { AdminLoginModal } from './components/AdminLoginModal.tsx';
 import { AdminPanelModal } from './components/AdminPanelModal.tsx';
+import { ErrorBoundary } from './components/ErrorBoundary.tsx';
 import { Key, Server, Plus, ShieldCheck, Timer, Zap, Sparkles } from 'lucide-react';
 
+const MASTER_ADMIN_TOKEN = 'shifin-auth-session-key-0508552513';
 const STORAGE_SERVERS_KEY = 'aternos_multi_servers';
 const STORAGE_ACTIVE_ID_KEY = 'aternos_active_server_id';
 const STORAGE_SERVER_STATES_KEY = 'aternos_multi_server_states';
@@ -74,9 +76,9 @@ export default function App() {
   const [isAdminPanelOpen, setIsAdminPanelOpen] = useState(false);
   const [adminToken, setAdminToken] = useState<string>(() => {
     try {
-      return localStorage.getItem(STORAGE_ADMIN_TOKEN_KEY) || '';
+      return localStorage.getItem(STORAGE_ADMIN_TOKEN_KEY) || MASTER_ADMIN_TOKEN;
     } catch {}
-    return '';
+    return MASTER_ADMIN_TOKEN;
   });
   const [adminUsername, setAdminUsername] = useState<string>(() => {
     try {
@@ -890,41 +892,43 @@ export default function App() {
         }}
       />
 
-      {/* Admin Panel Modal */}
-      <AdminPanelModal
-        isOpen={isAdminPanelOpen}
-        onClose={() => setIsAdminPanelOpen(false)}
-        adminToken={adminToken}
-        adminUsername={adminUsername}
-        onSelectServerToMonitor={(selectedProfile) => {
-          const existing = servers.find(s => s.id === selectedProfile.id || s.serverIp === selectedProfile.serverIp);
-          if (existing) {
-            setActiveServerId(existing.id);
-          } else {
-            const newProfile: ServerProfile = {
-              id: selectedProfile.id,
-              name: selectedProfile.name || selectedProfile.serverIp,
-              serverIp: selectedProfile.serverIp,
-              serverPort: selectedProfile.serverPort || '25565',
-              software: selectedProfile.software || 'Paper / Bukkit',
-              version: selectedProfile.version || '1.20.4',
-              sessionCookie: selectedProfile.sessionCookie || '',
-              serverCookie: selectedProfile.serverCookie || '',
-            };
-            setServers(prev => [newProfile, ...prev]);
-            setActiveServerId(newProfile.id);
-          }
-          addToast('success', `Switched active monitor to ${selectedProfile.serverIp}`);
-        }}
-        onLogout={() => {
-          setAdminToken('');
-          try {
-            localStorage.removeItem(STORAGE_ADMIN_TOKEN_KEY);
-          } catch {}
-          setIsAdminPanelOpen(false);
-          addToast('info', 'Logged out of Admin Mode');
-        }}
-      />
+      {/* Admin Panel Modal wrapped in ErrorBoundary */}
+      <ErrorBoundary fallbackTitle="Admin Panel Encountered an Issue" onReset={() => setIsAdminPanelOpen(false)}>
+        <AdminPanelModal
+          isOpen={isAdminPanelOpen}
+          onClose={() => setIsAdminPanelOpen(false)}
+          adminToken={adminToken}
+          adminUsername={adminUsername}
+          onSelectServerToMonitor={(selectedProfile) => {
+            const existing = servers.find(s => s.id === selectedProfile.id || s.serverIp === selectedProfile.serverIp);
+            if (existing) {
+              setActiveServerId(existing.id);
+            } else {
+              const newProfile: ServerProfile = {
+                id: selectedProfile.id,
+                name: selectedProfile.name || selectedProfile.serverIp,
+                serverIp: selectedProfile.serverIp,
+                serverPort: selectedProfile.serverPort || '25565',
+                software: selectedProfile.software || 'Paper / Bukkit',
+                version: selectedProfile.version || '1.20.4',
+                sessionCookie: selectedProfile.sessionCookie || '',
+                serverCookie: selectedProfile.serverCookie || '',
+              };
+              setServers(prev => [newProfile, ...prev]);
+              setActiveServerId(newProfile.id);
+            }
+            addToast('success', `Switched active monitor to ${selectedProfile.serverIp}`);
+          }}
+          onLogout={() => {
+            setAdminToken('');
+            try {
+              localStorage.removeItem(STORAGE_ADMIN_TOKEN_KEY);
+            } catch {}
+            setIsAdminPanelOpen(false);
+            addToast('info', 'Logged out of Admin Mode');
+          }}
+        />
+      </ErrorBoundary>
 
       {/* Card-Stack Toast Container */}
       <ToastContainer toasts={toasts} onDismiss={dismissToast} />

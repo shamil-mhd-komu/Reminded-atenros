@@ -55,6 +55,24 @@ function createPacket(packetId: number, data: Buffer): Buffer {
   return Buffer.concat([lengthBuf, idBuf, data]);
 }
 
+// Aternos proxy returns "● Offline" or protocol -1 when server is turned off
+export function isAternosOfflineIndicator(versionName?: string, motdClean?: string, protocolVersion?: number): boolean {
+  const v = (versionName || '').toLowerCase().trim();
+  const m = (motdClean || '').toLowerCase().trim();
+  if (protocolVersion === -1) return true;
+  if (v.includes('offline') || v.includes('● offline') || v === 'offline' || v === '●') return true;
+  if (
+    m.includes('server is offline') ||
+    m.includes('this server is offline') ||
+    m.includes('get this server more ram') ||
+    m.includes('● offline') ||
+    m.includes('offline server')
+  ) {
+    return true;
+  }
+  return false;
+}
+
 // Fast Low-level TCP Minecraft SLP ping (timeout 900ms)
 export async function pingMinecraftDirect(host: string, port: number = 25565, timeoutMs: number = 900): Promise<PingResult | null> {
   return new Promise(resolve => {
@@ -128,6 +146,22 @@ export async function pingMinecraftDirect(host: string, port: number = 25565, ti
                 const jsonStr = receivedBuffer.toString('utf8', offset, offset + stringLen);
                 const data = JSON.parse(jsonStr);
 
+                const verName = data.version?.name || '';
+                const motdText = typeof data.description === 'string' ? data.description : data.description?.text || '';
+                const protocol = data.version?.protocol;
+
+                // Explicitly check for Aternos offline proxy
+                if (isAternosOfflineIndicator(verName, motdText, protocol)) {
+                  cleanup();
+                  resolve({
+                    online: false,
+                    players: { online: 0, max: 20, list: [] },
+                    version: verName,
+                    motd: motdText,
+                  });
+                  return;
+                }
+
                 const sample = Array.isArray(data.players?.sample) ? data.players.sample : [];
                 const list: PingPlayer[] = sample.map((p: any) => ({
                   name: p.name,
@@ -143,8 +177,8 @@ export async function pingMinecraftDirect(host: string, port: number = 25565, ti
                     max: data.players?.max || 20,
                     list,
                   },
-                  version: data.version?.name,
-                  motd: typeof data.description === 'string' ? data.description : data.description?.text,
+                  version: verName,
+                  motd: motdText,
                 });
               }
             }
@@ -190,11 +224,11 @@ export async function pingMinecraftDirect(host: string, port: number = 25565, ti
   });
 }
 
-// 10-second memory cache for instant responses
+// 6-second memory cache for instant responses
 const pingCache: Map<string, { time: number; result: PingResult }> = new Map();
 const inFlightPings: Map<string, Promise<PingResult>> = new Map();
 
-// Fast concurrent query querying direct TCP and HTTP APIs in parallel with caching & accurate fallbacks
+// Fast concurrent query querying direct TCP and HTTP APIs in parallel with accurate offline detection
 export async function queryMinecraftServer(
   serverAddress: string,
   dynip?: string,
@@ -206,7 +240,7 @@ export async function queryMinecraftServer(
   const cached = pingCache.get(cacheKey);
   const now = Date.now();
 
-  if (cached && now - cached.time < 6000) {
+  if (cached && now - cached.time < 5000) {
     return cached.result;
   }
 
@@ -217,147 +251,182 @@ export async function queryMinecraftServer(
 
   const queryPromise = (async (): Promise<PingResult> => {
     try {
+      const parseAddress = (addr: string) => {
+        const parts = addr.split(':');
+        return {
+          host: parts[0].trim(),
+          port: parts[1] ? parseInt(parts[1], 10) : 25565,
+        };
+      };
 
-  const parseAddress = (addr: string) => {
-    const parts = addr.split(':');
-    return {
-      host: parts[0].trim(),
-      port: parts[1] ? parseInt(parts[1], 10) : 25565,
-    };
-  };
+      const targets: Array<{ host: string; port: number }> = [];
+      if (dynip && dynip.trim()) targets.push(parseAddress(dynip.trim()));
+      if (serverAddress && serverAddress.trim()) targets.push(parseAddress(serverAddress.trim()));
 
-  const targets: Array<{ host: string; port: number }> = [];
-  if (dynip && dynip.trim()) targets.push(parseAddress(dynip.trim()));
-  if (serverAddress && serverAddress.trim()) targets.push(parseAddress(serverAddress.trim()));
+      const tasks: Promise<PingResult | null>[] = [];
 
-  const tasks: Promise<PingResult | null>[] = [];
-
-  // Direct TCP checks
-  for (const t of targets) {
-    tasks.push(pingMinecraftDirect(t.host, t.port, 1500));
-  }
-
-  // Fast mcstatus.io fetch
-  for (const t of targets) {
-    const targetStr = t.port === 25565 ? t.host : `${t.host}:${t.port}`;
-    tasks.push(
-      (async (): Promise<PingResult | null> => {
-        try {
-          const ac = new AbortController();
-          const tm = setTimeout(() => ac.abort(), 3000);
-          const res = await fetch(`https://api.mcstatus.io/v2/status/java/${encodeURIComponent(targetStr)}`, {
-            signal: ac.signal,
-          });
-          clearTimeout(tm);
-          if (res.ok) {
-            const data = await res.json();
-            if (data?.online) {
-              const rawList = Array.isArray(data.players?.list) ? data.players.list : [];
-              const list: PingPlayer[] = rawList.map((p: any) => {
-                const name = typeof p === 'string' ? p : p.name_clean || p.name_raw || p.name || '';
-                return {
-                  name,
-                  uuid: typeof p === 'object' ? p.uuid : undefined,
-                  avatarUrl: `https://minotar.net/helm/${encodeURIComponent(name)}/32.png`,
-                };
-              }).filter((p: PingPlayer) => Boolean(p.name));
-
-              return {
-                online: true,
-                players: {
-                  online: data.players?.online ?? list.length,
-                  max: data.players?.max || 20,
-                  list,
-                },
-                version: data.version?.name_clean || data.version?.name_raw,
-                motd: data.motd?.clean,
-              };
-            }
-          }
-        } catch {}
-        return null;
-      })()
-    );
-  }
-
-  // Fast mcsrvstat.us fetch
-  for (const t of targets) {
-    const targetStr = t.port === 25565 ? t.host : `${t.host}:${t.port}`;
-    tasks.push(
-      (async (): Promise<PingResult | null> => {
-        try {
-          const ac = new AbortController();
-          const tm = setTimeout(() => ac.abort(), 3000);
-          const res = await fetch(`https://api.mcsrvstat.us/3/${encodeURIComponent(targetStr)}`, {
-            signal: ac.signal,
-          });
-          clearTimeout(tm);
-          if (res.ok) {
-            const data = await res.json();
-            if (data?.online) {
-              const rawList = Array.isArray(data.players?.list) ? data.players.list : [];
-              const list: PingPlayer[] = rawList.map((p: any) => {
-                const name = typeof p === 'string' ? p : p.name || p.name_clean || '';
-                return {
-                  name,
-                  uuid: typeof p === 'object' ? p.uuid : undefined,
-                  avatarUrl: `https://minotar.net/helm/${encodeURIComponent(name)}/32.png`,
-                };
-              }).filter((p: PingPlayer) => Boolean(p.name));
-
-              return {
-                online: true,
-                players: {
-                  online: data.players?.online ?? list.length,
-                  max: data.players?.max || 20,
-                  list,
-                },
-                version: data.version,
-                motd: Array.isArray(data.motd?.clean) ? data.motd.clean.join(' ') : data.motd?.clean,
-              };
-            }
-          }
-        } catch {}
-        return null;
-      })()
-    );
-  }
-
-  // Await the fastest successful response
-  try {
-    const results = await Promise.all(tasks);
-    const onlineResult = results.find(r => r && r.online);
-    if (onlineResult) {
-      // Merge in any fallback players known from Aternos console that might not appear in sample
-      const existingNames = new Set(onlineResult.players.list.map(p => p.name.toLowerCase()));
-      for (const name of fallbackPlayerList) {
-        if (name && !existingNames.has(name.toLowerCase())) {
-          onlineResult.players.list.push({
-            name,
-            avatarUrl: `https://minotar.net/helm/${encodeURIComponent(name)}/32.png`,
-          });
-        }
+      // Direct TCP checks
+      for (const t of targets) {
+        tasks.push(pingMinecraftDirect(t.host, t.port, 1200));
       }
-      onlineResult.players.online = Math.max(onlineResult.players.online, onlineResult.players.list.length, fallbackCount);
-      pingCache.set(cacheKey, { time: now, result: onlineResult });
-      return onlineResult;
-    }
-  } catch {}
 
-  // Accurate Fallback using Aternos internal state
-  const isServerOnline = fallbackOnline || fallbackCount > 0 || fallbackPlayerList.length > 0;
-  const listFromFallback: PingPlayer[] = fallbackPlayerList.map(name => ({
-    name,
-    avatarUrl: `https://minotar.net/helm/${encodeURIComponent(name)}/32.png`,
-  }));
+      // Fast mcstatus.io fetch
+      for (const t of targets) {
+        const targetStr = t.port === 25565 ? t.host : `${t.host}:${t.port}`;
+        tasks.push(
+          (async (): Promise<PingResult | null> => {
+            try {
+              const ac = new AbortController();
+              const tm = setTimeout(() => ac.abort(), 2500);
+              const res = await fetch(`https://api.mcstatus.io/v2/status/java/${encodeURIComponent(targetStr)}`, {
+                signal: ac.signal,
+              });
+              clearTimeout(tm);
+              if (res.ok) {
+                const data = await res.json();
+                if (data?.online) {
+                  const verName = data.version?.name_clean || data.version?.name_raw || '';
+                  const motdClean = data.motd?.clean || '';
+                  const proto = data.version?.protocol;
+
+                  if (isAternosOfflineIndicator(verName, motdClean, proto)) {
+                    return {
+                      online: false,
+                      players: { online: 0, max: 20, list: [] },
+                      version: verName,
+                      motd: motdClean,
+                    };
+                  }
+
+                  const rawList = Array.isArray(data.players?.list) ? data.players.list : [];
+                  const list: PingPlayer[] = rawList.map((p: any) => {
+                    const name = typeof p === 'string' ? p : p.name_clean || p.name_raw || p.name || '';
+                    return {
+                      name,
+                      uuid: typeof p === 'object' ? p.uuid : undefined,
+                      avatarUrl: `https://minotar.net/helm/${encodeURIComponent(name)}/32.png`,
+                    };
+                  }).filter((p: PingPlayer) => Boolean(p.name));
+
+                  return {
+                    online: true,
+                    players: {
+                      online: data.players?.online ?? list.length,
+                      max: data.players?.max || 20,
+                      list,
+                    },
+                    version: verName,
+                    motd: motdClean,
+                  };
+                }
+              }
+            } catch {}
+            return null;
+          })()
+        );
+      }
+
+      // Fast mcsrvstat.us fetch
+      for (const t of targets) {
+        const targetStr = t.port === 25565 ? t.host : `${t.host}:${t.port}`;
+        tasks.push(
+          (async (): Promise<PingResult | null> => {
+            try {
+              const ac = new AbortController();
+              const tm = setTimeout(() => ac.abort(), 2500);
+              const res = await fetch(`https://api.mcsrvstat.us/3/${encodeURIComponent(targetStr)}`, {
+                signal: ac.signal,
+              });
+              clearTimeout(tm);
+              if (res.ok) {
+                const data = await res.json();
+                if (data?.online) {
+                  const verName = String(data.version || '');
+                  const motdClean = Array.isArray(data.motd?.clean) ? data.motd.clean.join(' ') : String(data.motd?.clean || '');
+                  const proto = data.protocol?.version;
+
+                  if (isAternosOfflineIndicator(verName, motdClean, proto)) {
+                    return {
+                      online: false,
+                      players: { online: 0, max: 20, list: [] },
+                      version: verName,
+                      motd: motdClean,
+                    };
+                  }
+
+                  const rawList = Array.isArray(data.players?.list) ? data.players.list : [];
+                  const list: PingPlayer[] = rawList.map((p: any) => {
+                    const name = typeof p === 'string' ? p : p.name || p.name_clean || '';
+                    return {
+                      name,
+                      uuid: typeof p === 'object' ? p.uuid : undefined,
+                      avatarUrl: `https://minotar.net/helm/${encodeURIComponent(name)}/32.png`,
+                    };
+                  }).filter((p: PingPlayer) => Boolean(p.name));
+
+                  return {
+                    online: true,
+                    players: {
+                      online: data.players?.online ?? list.length,
+                      max: data.players?.max || 20,
+                      list,
+                    },
+                    version: verName,
+                    motd: motdClean,
+                  };
+                }
+              }
+            } catch {}
+            return null;
+          })()
+        );
+      }
+
+      // Await results
+      try {
+        const results = await Promise.all(tasks);
+        const hasExplicitOffline = results.some(r => r && !r.online && isAternosOfflineIndicator(r.version, r.motd));
+        if (hasExplicitOffline) {
+          const offlineRes: PingResult = {
+            online: false,
+            players: { online: 0, max: 20, list: [] },
+            version: '● Offline',
+            motd: 'This server is offline.',
+          };
+          pingCache.set(cacheKey, { time: now, result: offlineRes });
+          return offlineRes;
+        }
+
+        const onlineResult = results.find(r => r && r.online);
+        if (onlineResult) {
+          const existingNames = new Set(onlineResult.players.list.map(p => p.name.toLowerCase()));
+          for (const name of fallbackPlayerList) {
+            if (name && !existingNames.has(name.toLowerCase())) {
+              onlineResult.players.list.push({
+                name,
+                avatarUrl: `https://minotar.net/helm/${encodeURIComponent(name)}/32.png`,
+              });
+            }
+          }
+          onlineResult.players.online = Math.max(onlineResult.players.online, onlineResult.players.list.length, fallbackCount);
+          pingCache.set(cacheKey, { time: now, result: onlineResult });
+          return onlineResult;
+        }
+      } catch {}
+
+      // If direct ping and external APIs all failed, server is unreachable / offline
+      const isServerOnline = false;
+      const listFromFallback: PingPlayer[] = [];
 
       const fallbackResult: PingResult = {
-        online: isServerOnline,
+        online: false,
         players: {
-          online: Math.max(fallbackCount, listFromFallback.length),
+          online: 0,
           max: 20,
-          list: listFromFallback,
+          list: [],
         },
+        version: '● Offline',
+        motd: 'This server is offline.',
       };
       pingCache.set(cacheKey, { time: now, result: fallbackResult });
       return fallbackResult;

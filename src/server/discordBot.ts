@@ -1,3 +1,6 @@
+import 'dotenv/config';
+import fs from 'fs';
+import path from 'path';
 import {
   Client,
   GatewayIntentBits,
@@ -8,18 +11,21 @@ import {
   ActionRowBuilder,
   StringSelectMenuBuilder,
   StringSelectMenuOptionBuilder,
-  AttachmentBuilder,
   type ChatInputCommandInteraction,
   type StringSelectMenuInteraction,
 } from 'discord.js';
-import sharp from 'sharp';
 import { aternosService } from './aternosAutomation.ts';
 import type { AternosState } from '../types/aternos.ts';
 import { serverStorage } from './serverStorage.ts';
-import { queryMinecraftServer } from './mcPing.ts';
+import { queryMinecraftServer, isAternosOfflineIndicator } from './mcPing.ts';
 
-const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN || '';
+const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN || 'MTU1NTMzMDg1Njc1Nzc1NTk5NA.GLEqGe.jXMPh6b0PV8HEOB0sKBRbGTkOTBxgGmiX3tSOQ';
 const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID || '1555330856757755994';
+
+export const IS_PRODUCTION =
+  process.env.NODE_ENV === 'production' ||
+  !fs.existsSync(path.resolve(process.cwd(), 'vite.config.ts'));
+export const CURRENT_ENV: 'dev' | 'published' = IS_PRODUCTION ? 'published' : 'dev';
 
 interface DiscoveredServer {
   id: string;
@@ -43,28 +49,19 @@ export class DiscordBotService {
   private botId: string = '';
   private lastPing: number = 0;
   private initError: string | null = null;
+  private reconnectTimer: NodeJS.Timeout | null = null;
+  private isExplicitlyStopped: boolean = false;
+
+  // Track the last message sent in each channel so each new command deletes the previous one
+  private lastChannelMessageIds: Map<string, string> = new Map();
 
   // Player head emoji cache: playerName.toLowerCase() -> '<:head_name:id>'
   private playerEmojiCache: Map<string, string> = new Map();
-  private canCreateApplicationEmojis: boolean = true;
-  private emojiQueue: string[] = [];
-  private isProcessingEmojiQueue: boolean = false;
-
-  // In-memory cache for bordered player head image buffers attached to Discord messages
-  private borderedHeadCache: Map<string, { buffer: Buffer; timestamp: number }> = new Map();
-
-  // Pending server selections for /configure
   private pendingSelections: Map<string, PendingSession> = new Map();
 
-  // Track previous interactions per user to delete older messages when a new command is run
-  private userLastInteractions: Map<string, { interaction: any; timestamp: number }[]> = new Map();
-
   constructor() {
-    // ONLY Guilds intent — no message content or message events needed
     this.client = new Client({
-      intents: [
-        GatewayIntentBits.Guilds,
-      ],
+      intents: [GatewayIntentBits.Guilds],
     });
 
     this.setupEventHandlers();
@@ -76,28 +73,25 @@ export class DiscordBotService {
       this.botTag = this.client.user?.tag || 'Aternos Bot';
       this.botId = this.client.user?.id || DISCORD_CLIENT_ID;
       this.lastPing = this.client.ws.ping;
-      console.log(`[Discord Bot] Ready as ${this.botTag} (${this.botId})`);
+      console.log(`[Discord Bot (${CURRENT_ENV.toUpperCase()})] Ready as ${this.botTag} (${this.botId})`);
 
       serverStorage.addDiscordLog({
         user: this.botTag,
         command: 'READY',
         serverAddress: 'discord.gateway',
         status: 'success',
-        message: `Connected in ${this.client.guilds.cache.size} server(s)`,
+        message: `Connected in ${this.client.guilds.cache.size} server(s) [${CURRENT_ENV.toUpperCase()}]`,
       });
 
-      // Preload application emojis into cache for 0ms lookup
-      await this.loadExistingApplicationEmojis();
-
-      // Register clean slash commands (no optional address parameter)
-      await this.registerSlashCommands();
+      // Preload emojis and register slash commands
+      await this.loadExistingApplicationEmojis().catch(() => {});
+      await this.registerSlashCommands().catch(() => {});
     });
 
-    // Interaction handler (ONLY Slash Commands & Select Menus - NO ! commands)
+    // Interaction handler
     this.client.on('interactionCreate', async interaction => {
       try {
         if (interaction.isChatInputCommand()) {
-          // Fire non-blocking so simultaneous commands never stall each other
           this.handleSlashCommand(interaction).catch(err => {
             console.error('[Slash Command Unhandled]', err);
           });
@@ -115,19 +109,101 @@ export class DiscordBotService {
       console.error('[Discord Bot Error]', err?.message);
       this.initError = err.message;
     });
+
+    this.client.on('shardError', error => {
+      console.warn('[Discord Bot Shard Error]:', error?.message);
+    });
+
+    this.client.on('shardDisconnect', (event, shardId) => {
+      console.warn(`[Discord Bot Shard ${shardId} Disconnected] Code: ${event.code}`);
+      this.isReady = false;
+      this.scheduleReconnect();
+    });
+  }
+
+  private scheduleReconnect() {
+    if (this.isExplicitlyStopped) return;
+    if (this.reconnectTimer) return;
+
+    this.reconnectTimer = setTimeout(async () => {
+      this.reconnectTimer = null;
+      if (!this.isReady && !this.isExplicitlyStopped && DISCORD_BOT_TOKEN) {
+        const activeTarget = serverStorage.getBotTarget();
+        if (activeTarget === CURRENT_ENV) {
+          console.log(`[Discord Bot (${CURRENT_ENV})] Attempting gateway reconnect...`);
+          await this.start().catch(() => {});
+        }
+      }
+    }, 5000);
   }
 
   public async start(): Promise<void> {
-    if (!DISCORD_BOT_TOKEN) return;
+    const activeTarget = serverStorage.getBotTarget();
+    if (activeTarget !== CURRENT_ENV) {
+      console.log(`[Discord Bot] Idle on ${CURRENT_ENV}. Active target is "${activeTarget}". Bot will not connect here.`);
+      this.isExplicitlyStopped = true;
+      return;
+    }
+
+    if (!DISCORD_BOT_TOKEN) {
+      console.warn('[Discord Bot] No token provided.');
+      return;
+    }
+
+    if (this.isReady) {
+      console.log(`[Discord Bot (${CURRENT_ENV})] Already running.`);
+      return;
+    }
+
     try {
+      this.isExplicitlyStopped = false;
+      this.initError = null;
       await this.client.login(DISCORD_BOT_TOKEN);
     } catch (err: any) {
       this.initError = err.message;
-      console.error('[Discord Bot] Login failed:', err?.message);
+      console.error(`[Discord Bot (${CURRENT_ENV})] Login failed:`, err?.message);
+      this.scheduleReconnect();
     }
   }
 
-  // Pre-fetch all application emojis at startup so lookups are 0ms in-memory
+  public async stop(): Promise<void> {
+    this.isExplicitlyStopped = true;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+
+    if (!this.isReady && !this.client.isReady()) {
+      return;
+    }
+
+    try {
+      this.isReady = false;
+      this.client.destroy();
+      console.log(`[Discord Bot (${CURRENT_ENV})] Successfully disconnected and stopped.`);
+      serverStorage.addDiscordLog({
+        user: this.botTag || 'Aternos Bot',
+        command: 'STOP',
+        serverAddress: 'discord.gateway',
+        status: 'warning',
+        message: `Bot stopped on ${CURRENT_ENV}`,
+      });
+    } catch (err: any) {
+      console.warn('[Discord Bot] Error during stop:', err?.message);
+    }
+  }
+
+  public async setTargetMode(target: 'dev' | 'published' | 'disabled'): Promise<void> {
+    serverStorage.setBotTarget(target);
+    if (target === CURRENT_ENV) {
+      console.log(`[Discord Bot] Activating on ${CURRENT_ENV}...`);
+      await this.start();
+    } else {
+      console.log(`[Discord Bot] Deactivating on ${CURRENT_ENV} (target is now ${target})...`);
+      await this.stop();
+    }
+  }
+
   private async loadExistingApplicationEmojis(): Promise<void> {
     try {
       const app = this.client.application as any;
@@ -143,19 +219,15 @@ export class DiscordBotService {
             }
           }
         });
-        console.log(`[Discord Bot] Loaded ${emojis.size} pre-existing application head emojis into memory cache.`);
       }
-    } catch (err: any) {
-      console.warn('[Discord Bot] Could not preload application emojis:', err?.message);
-    }
+    } catch {}
   }
 
-  // Register Clean Slash Commands WITHOUT optional server address parameter
   private async registerSlashCommands() {
     const commands = [
       new SlashCommandBuilder()
         .setName('configure')
-        .setDescription('Link your Aternos server with your session')
+        .setDescription('Link your Aternos server with your session cookie')
         .addStringOption(o => o.setName('session').setDescription('Aternos session cookie').setRequired(true)),
 
       new SlashCommandBuilder()
@@ -172,21 +244,31 @@ export class DiscordBotService {
 
       new SlashCommandBuilder()
         .setName('status')
-        .setDescription('Check server status, online players, and port details'),
+        .setDescription('Check server online/offline status, players, and details'),
 
       new SlashCommandBuilder()
         .setName('players')
-        .setDescription('View connected players and their small avatars'),
+        .setDescription('View connected players and active player count'),
     ];
 
     try {
       const rest = new REST({ version: '10' }).setToken(DISCORD_BOT_TOKEN);
-      await rest.put(Routes.applicationCommands(this.botId || DISCORD_CLIENT_ID), {
+      const targetId = this.botId || DISCORD_CLIENT_ID;
+
+      // Register global commands
+      await rest.put(Routes.applicationCommands(targetId), {
         body: commands.map(cmd => cmd.toJSON()),
       });
-      console.log('[Discord Bot] Clean slash commands registered successfully.');
+      console.log('[Discord Bot] Global slash commands registered.');
+
+      // Also register per-guild for instant update in all active guilds
+      for (const [guildId] of this.client.guilds.cache) {
+        rest.put(Routes.applicationGuildCommands(targetId, guildId), {
+          body: commands.map(cmd => cmd.toJSON()),
+        }).catch(() => {});
+      }
     } catch (err: any) {
-      console.warn('[Discord Bot] Slash commands notice:', err?.message);
+      console.warn('[Discord Bot] Slash commands registration notice:', err?.message);
     }
   }
 
@@ -222,7 +304,7 @@ export class DiscordBotService {
       }
     }
 
-    // Next, check active server configured in aternosService
+    // Check active server configured in aternosService
     const cfg = aternosService.getConfig();
     if (cfg.serverAddress) {
       const canonical = serverStorage.getCanonicalServerAddress(cfg.serverAddress);
@@ -255,20 +337,14 @@ export class DiscordBotService {
     };
   }
 
-  // Instant 0ms synchronous head emoji lookup.
-  // Never blocks, never stalls commands, never causes Discord rate limit issues.
-  // If emoji exists in memory, returns <:head_name:id>.
-  // If not, returns 👤 immediately and queues background creation.
   private getPlayerHeadEmoji(playerName: string): string {
     const cleanName = playerName.trim();
     if (!cleanName) return '👤';
     const cacheKey = cleanName.toLowerCase().replace(/[^a-z0-9_]/g, '_').slice(0, 26);
 
-    // 1. Direct hit in memory cache
     const cached = this.playerEmojiCache.get(cacheKey);
     if (cached) return cached;
 
-    // 2. Check Discord client application emoji cache
     const app = this.client.application as any;
     const emojiName = `bhead_${cacheKey}`;
     const legacyName = `head_${cacheKey}`;
@@ -279,272 +355,84 @@ export class DiscordBotService {
       return formatted;
     }
 
-    // 3. Queue non-blocking background creation (throttled, isolated)
-    this.queueBackgroundEmojiCreation(cleanName);
-
     return '👤';
   }
 
-  // Queue background head creation so it NEVER slows down user interactions
-  private queueBackgroundEmojiCreation(playerName: string) {
-    if (!this.canCreateApplicationEmojis) return;
-    const cleanKey = playerName.trim().toLowerCase().replace(/[^a-z0-9_]/g, '_').slice(0, 26);
-    if (this.playerEmojiCache.has(cleanKey)) return;
-    if (this.emojiQueue.includes(playerName)) return;
+  // Fast resolution of fresh Aternos + Minecraft live status with strict offline verification
+  private async getFastServerState(serverAddress: string, sessionCookie?: string) {
+    let state: AternosState = aternosService.getState(serverAddress);
 
-    this.emojiQueue.push(playerName);
-    this.processEmojiQueue();
-  }
-
-  private async processEmojiQueue() {
-    if (this.isProcessingEmojiQueue || this.emojiQueue.length === 0) return;
-    this.isProcessingEmojiQueue = true;
-
-    try {
-      while (this.emojiQueue.length > 0) {
-        const nextName = this.emojiQueue.shift();
-        if (!nextName) continue;
-
-        const cleanKey = nextName.trim().toLowerCase().replace(/[^a-z0-9_]/g, '_').slice(0, 26);
-        if (this.playerEmojiCache.has(cleanKey)) continue;
-
-        await this.createHeadEmojiInBackground(nextName, cleanKey);
-
-        // Throttle 1500ms between creations to completely respect Discord REST limits
-        await new Promise(r => setTimeout(r, 1500));
-      }
-    } finally {
-      this.isProcessingEmojiQueue = false;
-    }
-  }
-
-  private async createHeadEmojiInBackground(cleanName: string, cacheKey: string): Promise<void> {
-    try {
-      const app = this.client.application as any;
-      if (!app?.emojis) return;
-
-      const emojiName = `bhead_${cacheKey}`;
-      let appEmojis = app.emojis.cache;
-      if (!appEmojis || appEmojis.size === 0) {
-        appEmojis = await app.emojis.fetch().catch(() => null);
-      }
-
-      const existing = appEmojis?.find((e: any) => e.name === emojiName);
-      if (existing) {
-        this.playerEmojiCache.set(cacheKey, `<:${existing.name}:${existing.id}>`);
-        return;
-      }
-
-      // If near limit of 50 emojis, delete oldest head_ or bhead_ emoji
-      if (appEmojis && appEmojis.size >= 48) {
-        const oldest = appEmojis.find((e: any) => e.name?.startsWith('head_') || e.name?.startsWith('bhead_'));
-        if (oldest) {
-          await oldest.delete().catch(() => {});
-        }
-      }
-
-      const candidateUrls = [
-        `https://mc-heads.net/avatar/${encodeURIComponent(cleanName)}/64`,
-        `https://crafthead.net/helm/${encodeURIComponent(cleanName)}/64`,
-        `https://minotar.net/helm/${encodeURIComponent(cleanName)}/64.png`,
-      ];
-
-      let imageBuf: Buffer | null = null;
-      for (const url of candidateUrls) {
-        try {
-          const controller = new AbortController();
-          const tm = setTimeout(() => controller.abort(), 1800);
-          const res = await fetch(url, { signal: controller.signal });
-          clearTimeout(tm);
-          if (res.ok) {
-            const arrayBuf = await res.arrayBuffer();
-            if (arrayBuf.byteLength > 200) {
-              imageBuf = Buffer.from(arrayBuf);
-              break;
-            }
-          }
-        } catch {}
-      }
-
-      if (!imageBuf) return;
-
-      const size = 64;
-      const radius = 14;
-      // High-contrast crisp border around player head image (dark base outline + emerald ring + crisp white highlight)
-      const maskSvg = Buffer.from(
-        `<svg width="${size}" height="${size}"><rect x="0" y="0" width="${size}" height="${size}" rx="${radius}" ry="${radius}" fill="white"/></svg>`
-      );
-      const borderSvg = Buffer.from(
-        `<svg width="${size}" height="${size}">
-          <rect x="1" y="1" width="${size - 2}" height="${size - 2}" rx="${radius}" ry="${radius}" fill="none" stroke="#18181b" stroke-width="4"/>
-          <rect x="1.5" y="1.5" width="${size - 3}" height="${size - 3}" rx="${radius}" ry="${radius}" fill="none" stroke="#10b981" stroke-width="3"/>
-          <rect x="2.5" y="2.5" width="${size - 5}" height="${size - 5}" rx="${radius - 1}" ry="${radius - 1}" fill="none" stroke="#ffffff" stroke-width="2" stroke-opacity="0.95"/>
-        </svg>`
-      );
-      const roundedBuf = await sharp(imageBuf)
-        .resize(size, size)
-        .composite([
-          { input: maskSvg, blend: 'dest-in' },
-          { input: borderSvg, blend: 'over' },
-        ])
-        .png()
-        .toBuffer();
-
-      const created = await app.emojis.create({
-        attachment: roundedBuf,
-        name: emojiName,
-      });
-
-      if (created) {
-        this.playerEmojiCache.set(cacheKey, `<:${created.name}:${created.id}>`);
-      }
-    } catch (err: any) {
-      if (err?.code === 30008 || err?.status === 403) {
-        this.canCreateApplicationEmojis = false;
-      }
-    }
-  }
-
-  // Generate a standalone high-resolution bordered player head image buffer for message attachments
-  public async generateBorderedPlayerHead(
-    playerName: string,
-    statusColorHex = '#10b981'
-  ): Promise<Buffer | null> {
-    const cleanName = (playerName || 'Steve').trim();
-    const cacheKey = `${cleanName.toLowerCase()}_${statusColorHex.toLowerCase()}`;
-    const cached = this.borderedHeadCache.get(cacheKey);
-    if (cached && Date.now() - cached.timestamp < 15 * 60 * 1000) {
-      return cached.buffer;
-    }
-
-    const candidateUrls = [
-      `https://mc-heads.net/avatar/${encodeURIComponent(cleanName)}/136`,
-      `https://crafthead.net/helm/${encodeURIComponent(cleanName)}/136`,
-      `https://minotar.net/helm/${encodeURIComponent(cleanName)}/136.png`,
-    ];
-
-    let rawBuf: Buffer | null = null;
-    for (const url of candidateUrls) {
+    // Sync from Aternos if older than 3s
+    if (sessionCookie || Date.now() - state.lastUpdated > 3000) {
       try {
-        const ac = new AbortController();
-        const tm = setTimeout(() => ac.abort(), 2000);
-        const res = await fetch(url, { signal: ac.signal });
-        clearTimeout(tm);
-        if (res.ok) {
-          const arrayBuf = await res.arrayBuffer();
-          if (arrayBuf.byteLength > 200) {
-            rawBuf = Buffer.from(arrayBuf);
-            break;
-          }
-        }
+        const syncTimeout = new Promise<AternosState>(resolve => setTimeout(() => resolve(state), 2000));
+        state = await Promise.race([aternosService.syncSessionState(serverAddress), syncTimeout]);
       } catch {}
     }
 
-    // Fallback: If network failed, fetch default Steve avatar
-    if (!rawBuf && cleanName.toLowerCase() !== 'steve') {
-      try {
-        const res = await fetch('https://mc-heads.net/avatar/Steve/136');
-        if (res.ok) {
-          rawBuf = Buffer.from(await res.arrayBuffer());
-        }
-      } catch {}
+    // Fast Minecraft server query
+    const live = await queryMinecraftServer(
+      serverAddress,
+      state.dynip,
+      state.playersOnline || 0,
+      state.playerList || [],
+      state.status === 'online' || state.status === 'starting'
+    );
+
+    const isLiveOffline = !live?.online || isAternosOfflineIndicator(live?.version, live?.motd);
+    const isStateStarting = state.status === 'starting';
+
+    // If server is verified offline or stopping, reset countdown states
+    if (state.status === 'offline' || state.status === 'stopping' || (isLiveOffline && state.status !== 'online' && !isStateStarting)) {
+      if (isLiveOffline && !isStateStarting) {
+        state.countdownActive = false;
+        state.countdownSeconds = null;
+        state.countdownFormatted = null;
+        state.canExtend = false;
+        state.playersOnline = 0;
+        state.playerList = [];
+      }
     }
 
-    if (!rawBuf) return null;
-
-    try {
-      const canvasSize = 160;
-      const avatarSize = 136;
-      const offset = 12; // (160 - 136) / 2
-      const radius = 24;
-
-      const maskSvg = Buffer.from(
-        `<svg width="${avatarSize}" height="${avatarSize}"><rect x="0" y="0" width="${avatarSize}" height="${avatarSize}" rx="${radius}" ry="${radius}" fill="white"/></svg>`
-      );
-
-      const roundedAvatar = await sharp(rawBuf)
-        .resize(avatarSize, avatarSize)
-        .composite([{ input: maskSvg, blend: 'dest-in' }])
-        .png()
-        .toBuffer();
-
-      const borderOverlaySvg = Buffer.from(
-        `<svg width="${canvasSize}" height="${canvasSize}">
-          <!-- Outer dark foundation frame -->
-          <rect x="${offset - 2}" y="${offset - 2}" width="${avatarSize + 4}" height="${avatarSize + 4}" rx="${radius + 2}" ry="${radius + 2}" fill="none" stroke="#09090b" stroke-width="6"/>
-          <!-- Prominent Glowing Border -->
-          <rect x="${offset}" y="${offset}" width="${avatarSize}" height="${avatarSize}" rx="${radius}" ry="${radius}" fill="none" stroke="${statusColorHex}" stroke-width="6"/>
-          <!-- Inner Bright Accent Ring -->
-          <rect x="${offset + 2}" y="${offset + 2}" width="${avatarSize - 4}" height="${avatarSize - 4}" rx="${radius - 2}" ry="${radius - 2}" fill="none" stroke="#ffffff" stroke-width="3" stroke-opacity="0.95"/>
-        </svg>`
-      );
-
-      const finalCard = await sharp({
-        create: {
-          width: canvasSize,
-          height: canvasSize,
-          channels: 4,
-          background: { r: 0, g: 0, b: 0, alpha: 0 },
-        },
-      })
-        .composite([
-          { input: roundedAvatar, left: offset, top: offset },
-          { input: borderOverlaySvg, left: 0, top: 0 },
-        ])
-        .png()
-        .toBuffer();
-
-      this.borderedHeadCache.set(cacheKey, { buffer: finalCard, timestamp: Date.now() });
-      return finalCard;
-    } catch (err: any) {
-      console.warn('[Sharp Avatar Error]', err?.message);
-      return null;
-    }
+    return { state, live };
   }
 
-  // Build real-time server status diagnostics embed with bordered player head attachment
-  private async buildStatusEmbed(
+  // Build clean, polished real-time server status diagnostics embed (NO ASCII ART, NO BIG BOT HEAD)
+  private buildStatusEmbed(
     serverAddress: string,
     state: any,
-    live: any,
-    fallbackUser?: string
-  ): Promise<{ embed: EmbedBuilder; files: AttachmentBuilder[] }> {
+    live: any
+  ): EmbedBuilder {
     const canonicalAddr = serverStorage.getCanonicalServerAddress(serverAddress);
-    const files: AttachmentBuilder[] = [];
 
-    // Precise status determination:
+    // Precise offline/online check
     const isAternosOffline = state.status === 'offline';
-    const isAternosStopping = state.status === 'stopping';
-    const isAternosStarting = state.status === 'starting';
-    const isAternosQueue = state.status === 'queue';
+    const isStopping = state.status === 'stopping';
+    const isStarting = state.status === 'starting';
+    const isQueue = state.status === 'queue';
+    const isLiveOffline = !live?.online || isAternosOfflineIndicator(live?.version, live?.motd);
 
     let isOnline = false;
     let statusText = '🔴 Offline';
-    let color = 0xef4444;
-    let hexColor = '#ef4444';
+    let color = 0xef4444; // Red
 
-    if (isAternosStarting) {
-      statusText = `🟡 ${state.rawStatus || 'Starting ...'}`;
-      color = 0xf59e0b;
-      hexColor = '#f59e0b';
-    } else if (isAternosQueue) {
-      statusText = '⏳ In Queue';
-      color = 0xf59e0b;
-      hexColor = '#f59e0b';
-    } else if (isAternosStopping) {
+    if (isStopping) {
       statusText = '🟠 Stopping';
-      color = 0xf97316;
-      hexColor = '#f97316';
-    } else if (!isAternosOffline && (state.status === 'online' || live?.online)) {
+      color = 0xf97316; // Orange
+    } else if (isStarting) {
+      statusText = `🟡 ${state.rawStatus || 'Starting ...'}`;
+      color = 0xf59e0b; // Amber
+    } else if (isQueue) {
+      statusText = '⏳ In Queue';
+      color = 0xf59e0b; // Amber
+    } else if (!isAternosOffline && !isLiveOffline && Boolean(live?.online)) {
       isOnline = true;
       statusText = '🟢 Online';
-      color = 0x10b981;
-      hexColor = '#10b981';
+      color = 0x10b981; // Emerald Green
     } else {
       isOnline = false;
       statusText = '🔴 Offline';
-      color = 0xef4444;
-      hexColor = '#ef4444';
+      color = 0xef4444; // Red
     }
 
     const playerCount = isOnline ? Math.max(live?.players?.online || 0, state.playersOnline || 0) : 0;
@@ -565,53 +453,29 @@ export class DiscordBotService {
       }
     }
 
-    // Determine target player name for the bordered head thumbnail
-    const targetPlayer = playerNames.length > 0 ? playerNames[0] : (fallbackUser || 'Steve');
-
-    // ALWAYS attach the bordered player head image in the Discord message
-    const headBuf = await this.generateBorderedPlayerHead(targetPlayer, hexColor);
-    if (headBuf) {
-      const attachment = new AttachmentBuilder(headBuf, { name: 'player_head.png' });
-      files.push(attachment);
-    }
-
-    // Clean bordered status card in message description
-    const statusLine = `Status  : ${isOnline ? '🟢 Online' : isAternosStarting ? '🟡 Starting' : isAternosStopping ? '🟠 Stopping' : '🔴 Offline'}`;
-    const playerLine = `Players : ${playerCount}/${maxCount} active`;
-    const hostLine = `Address : ${canonicalAddr}:${state.serverPort || 25565}`;
-
-    const maxLen = Math.max(statusLine.length, playerLine.length, hostLine.length, 36);
-    const topBorder = `┌${'─'.repeat(maxLen + 4)}┐`;
-    const bottomBorder = `└${'─'.repeat(maxLen + 4)}┘`;
-    const cardBox = [
-      '```',
-      topBorder,
-      `│  ${statusLine.padEnd(maxLen + 2)}│`,
-      `│  ${playerLine.padEnd(maxLen + 2)}│`,
-      `│  ${hostLine.padEnd(maxLen + 2)}│`,
-      bottomBorder,
-      '```',
-    ].join('\n');
-
     const embed = new EmbedBuilder()
       .setColor(color)
-      .setTitle(`🎮 Minecraft Server Diagnostics`)
-      .setDescription(cardBox)
+      .setTitle(`🎮 ${canonicalAddr}`)
+      .setDescription(
+        isOnline
+          ? `🟢 Server is **Online** and joinable.`
+          : isStarting
+          ? `🟡 Server is **Starting** — please allow 1-2 minutes for world load.`
+          : isStopping
+          ? `🟠 Server is **Stopping** — saving world data.`
+          : `🔴 Server is **Offline**.`
+      )
       .addFields(
         { name: 'Status', value: `**${statusText}**`, inline: true },
-        { name: 'Players Online', value: `\`${playerCount}/${maxCount}\` active`, inline: true },
+        { name: 'Players', value: `\`${playerCount}/${maxCount}\` online`, inline: true },
         { name: 'Server Address', value: `\`${canonicalAddr}:${state.serverPort || 25565}\``, inline: true }
       );
-
-    if (files.length > 0) {
-      embed.setThumbnail('attachment://player_head.png');
-    }
 
     if (isOnline && state.dynip) {
       embed.addFields({ name: 'Direct Connect IP', value: `\`${state.dynip}\``, inline: true });
     }
 
-    if (state.software || live?.version) {
+    if (state.software || live?.version || state.version) {
       embed.addFields({
         name: 'Version & Software',
         value: `${state.software || 'Fabric'} ${live?.version || state.version || '1.20.4'}`,
@@ -619,7 +483,7 @@ export class DiscordBotService {
       });
     }
 
-    // Active players list with small player heads
+    // Online players list
     if (isOnline && playerNames.length > 0) {
       const playerListItems = playerNames.map(n => {
         const head = this.getPlayerHeadEmoji(n);
@@ -640,8 +504,7 @@ export class DiscordBotService {
       });
     }
 
-    // Keepalive Timer: ONLY when the server is genuinely ONLINE.
-    // Never show on offline or stopping servers.
+    // Keepalive Timer (only when genuinely online)
     if (isOnline) {
       if (playerCount > 0) {
         embed.addFields({
@@ -658,104 +521,75 @@ export class DiscordBotService {
 
         embed.addFields({
           name: '⏱️ Keepalive Timer',
-          value: `\`${formatted}\` remaining • Auto-shutdown <t:${targetEpoch}:R>\n*(Synced with Aternos dashboard)*`,
+          value: `\`${formatted}\` remaining • Auto-shutdown <t:${targetEpoch}:R>`,
           inline: false,
         });
       }
+    } else if (!isStarting && !isStopping) {
+      embed.addFields({
+        name: '💡 Action',
+        value: 'Server is currently offline. Use `/start` to turn it on!',
+        inline: false,
+      });
     }
 
-    // Set bot icon only in footer
-    embed.setFooter({ text: 'Aternos Command Center', iconURL: this.client.user?.displayAvatarURL() });
+    embed.setFooter({ text: 'Aternos Command Center' });
     embed.setTimestamp();
 
-    return { embed, files };
+    return embed;
   }
 
-  // Fast resolution of fresh Aternos + Minecraft live status with concurrency protection
-  private async getFastServerState(serverAddress: string, sessionCookie?: string) {
-    let state: AternosState = aternosService.getState(serverAddress);
+  // Delete previous bot message in channel before sending a new one
+  private async deletePreviousChannelMessage(contextId: string, channel: any) {
+    if (!channel) return;
 
-    // Sync from Aternos if offline or older than 3.5s, with strict 2500ms max timeout so Discord never lags
-    if (sessionCookie || Date.now() - state.lastUpdated > 3500) {
-      try {
-        const syncTimeout = new Promise<AternosState>(resolve => setTimeout(() => resolve(state), 2500));
-        state = await Promise.race([aternosService.syncSessionState(serverAddress), syncTimeout]);
-      } catch {}
-    }
-
-    const live = await queryMinecraftServer(
-      serverAddress,
-      state.dynip,
-      state.playersOnline || 0,
-      state.playerList || [],
-      state.status === 'online' || state.status === 'starting'
-    );
-
-    // If server is offline or stopping, guarantee all countdown states are reset
-    if (state.status === 'offline' || state.status === 'stopping' || (!live?.online && state.status !== 'online' && state.status !== 'starting')) {
-      state.countdownActive = false;
-      state.countdownSeconds = null;
-      state.countdownFormatted = null;
-      state.canExtend = false;
-      state.playersOnline = 0;
-      state.playerList = [];
-    }
-
-    return { state, live };
-  }
-
-  // Clean up previous bot messages for the user so each new command replaces the old message
-  private async deleteUserPreviousMessages(userId: string, currentInteraction: ChatInputCommandInteraction) {
-    // 1. Delete previous interaction reply for this user (both ephemeral and public)
-    const prevList = this.userLastInteractions.get(userId) || [];
-    for (const item of prevList) {
-      if (item.interaction && item.interaction.id !== currentInteraction.id) {
-        try {
-          if (Date.now() - item.timestamp < 14 * 60 * 1000) {
-            await item.interaction.deleteReply().catch(() => {});
-          }
-        } catch {}
-      }
-    }
-
-    // Retain only the current interaction for this user
-    this.userLastInteractions.set(userId, [
-      { interaction: currentInteraction, timestamp: Date.now() },
-    ]);
-
-    // 2. Also check if there are any lingering public messages sent by the bot in this channel and delete them
     try {
-      const channel = currentInteraction.channel;
-      if (channel && 'messages' in channel && typeof (channel as any).messages?.fetch === 'function') {
-        const fetched = await (channel as any).messages.fetch({ limit: 10 }).catch(() => null);
-        if (fetched) {
-          const botMessages = fetched.filter((m: any) => m.author?.id === this.client.user?.id);
-          for (const [, msg] of botMessages) {
-            await msg.delete().catch(() => {});
+      // 1. Delete message by tracked ID if known
+      const prevMsgId = this.lastChannelMessageIds.get(contextId);
+      if (prevMsgId && 'messages' in channel && typeof channel.messages?.fetch === 'function') {
+        const oldMsg = await channel.messages.fetch(prevMsgId).catch(() => null);
+        if (oldMsg && oldMsg.deletable) {
+          await oldMsg.delete().catch(() => {});
+        }
+      }
+
+      // 2. Sweep recent channel messages to purge any previous messages sent by THIS bot
+      if ('messages' in channel && typeof channel.messages?.fetch === 'function') {
+        const recent = await channel.messages.fetch({ limit: 12 }).catch(() => null);
+        if (recent && recent.size > 0) {
+          const myId = this.client.user?.id;
+          for (const [, msg] of recent) {
+            if (msg.author?.id === myId && msg.id !== prevMsgId && msg.deletable) {
+              await msg.delete().catch(() => {});
+            }
           }
         }
       }
     } catch {}
   }
 
-  // Handle Slash Command with complete concurrency and rate limit protection
+  // Handle Slash Command with immediate deferral, previous message deletion, and zero clutter
   private async handleSlashCommand(interaction: ChatInputCommandInteraction) {
     const { commandName, user, guildId, channelId } = interaction;
-    const contextId = guildId || channelId || user.id;
+    const contextId = channelId || guildId || user.id;
 
-    // Immediately defer interaction with ephemeral: true so ALL messages the bot sends
-    // are sent privately to the user who invoked the command ("Only you can see this").
+    // /configure contains sensitive session cookie, so it remains ephemeral
+    const isEphemeral = commandName === 'configure';
+
+    // 1. Immediately defer within 50ms so Discord never shows "Application did not respond"
     try {
       if (!interaction.deferred && !interaction.replied) {
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ ephemeral: isEphemeral });
       }
     } catch (err: any) {
       console.warn(`[Discord] Could not defer /${commandName}:`, err?.message);
       return;
     }
 
-    // Automatically delete the previous message the bot sent to this user so old messages don't stack up
-    await this.deleteUserPreviousMessages(user.id, interaction);
+    // 2. Delete previous bot message in this channel before sending the new one
+    if (!isEphemeral && interaction.channel) {
+      await this.deletePreviousChannelMessage(contextId, interaction.channel);
+    }
 
     try {
       switch (commandName) {
@@ -819,7 +653,7 @@ export class DiscordBotService {
                   value: '`/status` — Check online status & player count\n`/players` — View online players\n`/start` — Turn on server\n`/stop` — Turn off server\n`/restart` — Reboot server',
                 }
               )
-              .setFooter({ text: 'Aternos Command Center', iconURL: this.client.user?.displayAvatarURL() })
+              .setFooter({ text: 'Aternos Command Center' })
               .setTimestamp();
 
             await interaction.editReply({ embeds: [embed] });
@@ -882,28 +716,34 @@ export class DiscordBotService {
           const ctx = this.resolveServerContext(contextId, user.id);
           const { state, live } = await this.getFastServerState(ctx.serverAddress, ctx.sessionCookie);
 
-          if (state.status === 'online' || live.online) {
+          const isOnline = !isAternosOfflineIndicator(live?.version, live?.motd) && Boolean(live?.online) && state.status !== 'offline';
+
+          if (isOnline) {
             const embed = new EmbedBuilder()
               .setColor(0xef4444)
-              .setTitle('⚠️ Server is Already Online!')
-              .setDescription(`**${ctx.serverAddress}** is already online and running. You cannot start a server that is currently active.`)
+              .setTitle(`⚠️ ${ctx.serverAddress} is Already Online!`)
+              .setDescription(`Server is already online and joinable.`)
               .addFields(
                 { name: 'Status', value: '🟢 **Online**', inline: true },
-                { name: 'Players', value: `\`${live.players.online}/${live.players.max}\``, inline: true },
-                { name: 'Tip', value: 'Use `/stop` to shut it down, or `/restart` to reboot.', inline: false }
-              );
+                { name: 'Players', value: `\`${live.players?.online || 0}/${live.players?.max || 20}\``, inline: true },
+                { name: 'Tip', value: 'Use `/stop` to shut down, or `/restart` to reboot.', inline: false }
+              )
+              .setFooter({ text: 'Aternos Command Center' })
+              .setTimestamp();
             await interaction.editReply({ embeds: [embed] });
-            return;
+            break;
           }
 
           if (state.status === 'starting' || state.status === 'queue') {
             const embed = new EmbedBuilder()
               .setColor(0xf59e0b)
-              .setTitle('⏳ Server is Currently Booting Up!')
-              .setDescription(`**${ctx.serverAddress}** is already in the starting sequence. Please give it 1 to 2 minutes to load world data.`)
-              .addFields({ name: 'Current Status', value: `🟡 ${state.rawStatus || 'Starting ...'}` });
+              .setTitle(`⏳ ${ctx.serverAddress} is Booting Up!`)
+              .setDescription(`Server is already in the starting sequence. Please give it 1 to 2 minutes.`)
+              .addFields({ name: 'Current Status', value: `🟡 ${state.rawStatus || 'Starting ...'}` })
+              .setFooter({ text: 'Aternos Command Center' })
+              .setTimestamp();
             await interaction.editReply({ embeds: [embed] });
-            return;
+            break;
           }
 
           const res = await aternosService.startServer(ctx.serverAddress, {
@@ -923,20 +763,23 @@ export class DiscordBotService {
           if (res.success) {
             const embed = new EmbedBuilder()
               .setColor(0x10b981)
-              .setTitle('🚀 Server Boot Sequence Initiated')
-              .setDescription(`Start signal dispatched to Aternos for **${ctx.serverAddress}**.\nThe server is now starting up and will be ready for players in ~1-2 minutes.`)
+              .setTitle(`🚀 Starting ${ctx.serverAddress}`)
+              .setDescription(`Start signal sent to Aternos. The server is booting up and will be ready for players in ~1-2 minutes.`)
               .addFields(
                 { name: 'Status', value: '🟡 **Starting ...**', inline: true },
                 { name: 'Estimated Time', value: '~60-90 seconds', inline: true },
                 { name: 'Tip', value: 'Run `/status` in a moment to track startup progress.', inline: false }
               )
+              .setFooter({ text: 'Aternos Command Center' })
               .setTimestamp();
             await interaction.editReply({ embeds: [embed] });
           } else {
             const embed = new EmbedBuilder()
               .setColor(0xef4444)
               .setTitle('❌ Start Command Failed')
-              .setDescription(`Aternos rejected the start request:\n\`${res.message}\`\nVerify that your session cookie is valid via \`/configure\`.`);
+              .setDescription(`Aternos rejected the start request:\n\`${res.message}\`\nVerify that your session cookie is valid via \`/configure\`.`)
+              .setFooter({ text: 'Aternos Command Center' })
+              .setTimestamp();
             await interaction.editReply({ embeds: [embed] });
           }
           break;
@@ -946,23 +789,28 @@ export class DiscordBotService {
           const ctx = this.resolveServerContext(contextId, user.id);
           const { state, live } = await this.getFastServerState(ctx.serverAddress, ctx.sessionCookie);
 
-          if (state.status === 'offline' && !live.online) {
+          const isOnline = !isAternosOfflineIndicator(live?.version, live?.motd) && (live?.online || state.status === 'online');
+
+          if (!isOnline && state.status !== 'starting' && state.status !== 'stopping') {
             const embed = new EmbedBuilder()
               .setColor(0xef4444)
-              .setTitle('⚠️ Server is Already Offline!')
-              .setDescription(`**${ctx.serverAddress}** is already turned off. Cannot stop a server that isn't running.`)
-              .addFields({ name: 'Tip', value: 'Use `/start` if you would like to boot it up.' });
+              .setTitle(`⚠️ ${ctx.serverAddress} is Already Offline!`)
+              .setDescription(`Cannot stop a server that isn't running.\nUse \`/start\` if you would like to boot it up.`)
+              .setFooter({ text: 'Aternos Command Center' })
+              .setTimestamp();
             await interaction.editReply({ embeds: [embed] });
-            return;
+            break;
           }
 
           if (state.status === 'stopping') {
             const embed = new EmbedBuilder()
               .setColor(0xf59e0b)
-              .setTitle('⏳ Server is Already Shutting Down!')
-              .setDescription(`**${ctx.serverAddress}** is already in the shutdown sequence. Please wait while world files are saved.`);
+              .setTitle(`⏳ ${ctx.serverAddress} is Shutting Down!`)
+              .setDescription(`Server is already shutting down and saving world files.`)
+              .setFooter({ text: 'Aternos Command Center' })
+              .setTimestamp();
             await interaction.editReply({ embeds: [embed] });
-            return;
+            break;
           }
 
           const res = await aternosService.stopServer(ctx.serverAddress, {
@@ -982,16 +830,19 @@ export class DiscordBotService {
           if (res.success) {
             const embed = new EmbedBuilder()
               .setColor(0xf97316)
-              .setTitle('🛑 Server Shutdown Initiated')
-              .setDescription(`Stop signal successfully sent to Aternos for **${ctx.serverAddress}**.\nWorld progress is being saved and the server is powering down safely.`)
+              .setTitle(`🛑 Stopping ${ctx.serverAddress}`)
+              .setDescription(`Stop signal sent to Aternos. World progress is being saved and the server is powering down safely.`)
               .addFields({ name: 'Status', value: '🟠 **Stopping ...**', inline: true })
+              .setFooter({ text: 'Aternos Command Center' })
               .setTimestamp();
             await interaction.editReply({ embeds: [embed] });
           } else {
             const embed = new EmbedBuilder()
               .setColor(0xef4444)
               .setTitle('❌ Stop Command Failed')
-              .setDescription(`Aternos returned: \`${res.message}\``);
+              .setDescription(`Aternos returned: \`${res.message}\``)
+              .setFooter({ text: 'Aternos Command Center' })
+              .setTimestamp();
             await interaction.editReply({ embeds: [embed] });
           }
           break;
@@ -1008,9 +859,11 @@ export class DiscordBotService {
 
           const embed = new EmbedBuilder()
             .setColor(res.success ? 0x3b82f6 : 0xef4444)
-            .setTitle(res.success ? '🔄 Server Reboot Triggered' : '❌ Restart Failed')
-            .setDescription(`Restart signal sent to Aternos for **${ctx.serverAddress}**.\nThe server will cycle off and boot back up automatically.`)
-            .addFields({ name: 'Result', value: res.message });
+            .setTitle(res.success ? `🔄 Rebooting ${ctx.serverAddress}` : '❌ Restart Failed')
+            .setDescription(`Restart signal sent to Aternos. The server will cycle off and boot back up automatically.`)
+            .addFields({ name: 'Result', value: res.message })
+            .setFooter({ text: 'Aternos Command Center' })
+            .setTimestamp();
 
           await interaction.editReply({ embeds: [embed] });
           break;
@@ -1020,9 +873,8 @@ export class DiscordBotService {
           const ctx = this.resolveServerContext(contextId, user.id);
           const { state, live } = await this.getFastServerState(ctx.serverAddress, ctx.sessionCookie);
 
-          const fallbackUser = ctx.profile?.discordUser || user.username;
-          const { embed, files } = await this.buildStatusEmbed(ctx.serverAddress, state, live, fallbackUser);
-          await interaction.editReply({ embeds: [embed], files });
+          const embed = this.buildStatusEmbed(ctx.serverAddress, state, live);
+          await interaction.editReply({ embeds: [embed] });
           break;
         }
 
@@ -1030,69 +882,50 @@ export class DiscordBotService {
           const ctx = this.resolveServerContext(contextId, user.id);
           const { state, live } = await this.getFastServerState(ctx.serverAddress, ctx.sessionCookie);
 
-          const isOnline = live.online || state.status === 'online' || state.status === 'starting';
-
-          // Generate bordered avatar image buffer for thumbnail
-          const targetPlayer = (state.playerList && state.playerList[0]) || ctx.profile?.discordUser || user.username || 'Steve';
-          const headBuf = await this.generateBorderedPlayerHead(targetPlayer, isOnline ? '#10b981' : '#ef4444');
-          const files: AttachmentBuilder[] = [];
-          if (headBuf) {
-            files.push(new AttachmentBuilder(headBuf, { name: 'player_head.png' }));
-          }
+          const isAternosOffline = state.status === 'offline';
+          const isStopping = state.status === 'stopping';
+          const isStarting = state.status === 'starting';
+          const isLiveOffline = !live?.online || isAternosOfflineIndicator(live?.version, live?.motd);
+          const isOnline = !isAternosOffline && !isStopping && !isStarting && !isLiveOffline && Boolean(live?.online);
 
           if (!isOnline) {
             const embed = new EmbedBuilder()
               .setColor(0xef4444)
-              .setTitle('🔴 Server is Offline')
-              .setDescription([
-                '```',
-                '┌──────────────────────────────────────────┐',
-                '│  Server is currently offline.            │',
-                '│  Active players cannot be queried.       │',
-                '└──────────────────────────────────────────┘',
-                '```',
-                `Cannot fetch active players because **${ctx.serverAddress}** is currently offline.\nUse \`/start\` to bring the server online.`,
-              ].join('\n'));
+              .setTitle(`🔴 Server is Offline`)
+              .setDescription(`**${ctx.serverAddress}** is currently offline. Active players cannot be queried.\nUse \`/start\` to bring the server online!`)
+              .setFooter({ text: 'Aternos Command Center' })
+              .setTimestamp();
 
-            if (files.length > 0) {
-              embed.setThumbnail('attachment://player_head.png');
-            }
-            await interaction.editReply({ embeds: [embed], files });
-            return;
+            await interaction.editReply({ embeds: [embed] });
+            break;
           }
 
-          // Combine unique players from live SLP query and Aternos playerList
+          // Combine unique players
           const playerNames = new Set<string>();
-          for (const p of (live.players?.list || [])) {
-            if (p?.name) playerNames.add(p.name);
+          if (Array.isArray(live?.players?.list)) {
+            for (const p of live.players.list) {
+              if (p?.name) playerNames.add(p.name);
+            }
           }
-          for (const name of (state.playerList || [])) {
-            if (name) playerNames.add(name);
+          if (Array.isArray(state?.playerList)) {
+            for (const name of state.playerList) {
+              if (name) playerNames.add(name);
+            }
           }
 
           const combinedList = Array.from(playerNames);
-          const count = Math.max(combinedList.length, live.players?.online || 0, state.playersOnline || 0);
-          const max = live.players?.max || state.maxPlayers || 20;
+          const count = Math.max(combinedList.length, live?.players?.online || 0, state?.playersOnline || 0);
+          const max = live?.players?.max || state?.maxPlayers || 20;
 
           if (count === 0 && combinedList.length === 0) {
             const embed = new EmbedBuilder()
-              .setColor(0x71717a)
+              .setColor(0x10b981)
               .setTitle(`👥 No Players Online (0/${max})`)
-              .setDescription([
-                '```',
-                '┌──────────────────────────────────────────┐',
-                '│  0 players currently connected.          │',
-                '│  The world is waiting for players.       │',
-                '└──────────────────────────────────────────┘',
-                '```',
-                `There are currently 0 players connected to **${ctx.serverAddress}**.`,
-              ].join('\n'));
+              .setDescription(`There are currently **0** players connected to **${ctx.serverAddress}**.\nThe server is online and ready for players to join!`)
+              .setFooter({ text: 'Aternos Command Center' })
+              .setTimestamp();
 
-            if (files.length > 0) {
-              embed.setThumbnail('attachment://player_head.png');
-            }
-
-            if (isOnline && state.countdownActive && typeof state.countdownSeconds === 'number' && state.countdownSeconds > 0) {
+            if (state.countdownActive && typeof state.countdownSeconds === 'number' && state.countdownSeconds > 0) {
               const secs = state.countdownSeconds;
               const mins = Math.floor(secs / 60);
               const s = secs % 60;
@@ -1101,52 +934,45 @@ export class DiscordBotService {
 
               embed.addFields({
                 name: '⏱️ Keepalive Timer',
-                value: `\`${formatted}\` remaining • Auto-shutdown <t:${targetEpoch}:R>\n*(Synced with Aternos dashboard)*`,
+                value: `\`${formatted}\` remaining • Auto-shutdown <t:${targetEpoch}:R>`,
                 inline: false,
               });
             }
 
-            embed.setFooter({ text: 'Aternos Command Center', iconURL: this.client.user?.displayAvatarURL() });
-            embed.setTimestamp();
-
-            await interaction.editReply({ embeds: [embed], files });
-            return;
+            await interaction.editReply({ embeds: [embed] });
+            break;
           }
 
           const embed = new EmbedBuilder()
             .setColor(0x10b981)
-            .setTitle(`👥 Online Players (${count}/${max})`)
+            .setTitle(`👥 Connected Players (${count}/${max})`)
             .setDescription(`Active players currently connected to **${ctx.serverAddress}**:`)
+            .setFooter({ text: 'Aternos Command Center' })
             .setTimestamp();
 
-          if (files.length > 0) {
-            embed.setThumbnail('attachment://player_head.png');
-          }
-
-          if (combinedList.length > 0) {
-            const playerLines = combinedList.map((name, idx) => {
-              const headEmoji = this.getPlayerHeadEmoji(name);
-              return `**${idx + 1}.** ${headEmoji} **${name}**`;
-            });
-            embed.addFields({ name: 'Connected Players', value: playerLines.join('\n'), inline: false });
-          } else {
-            embed.setDescription(`There ${count === 1 ? 'is' : 'are'} currently **${count}** player${count > 1 ? 's' : ''} connected to the server.`);
-          }
-
-          embed.setFooter({
-            text: 'Aternos Command Center',
-            iconURL: this.client.user?.displayAvatarURL(),
+          const playerLines = combinedList.map((name, idx) => {
+            const headEmoji = this.getPlayerHeadEmoji(name);
+            return `**${idx + 1}.** ${headEmoji} **${name}**`;
           });
+          embed.addFields({ name: 'Player List', value: playerLines.join('\n'), inline: false });
 
-          await interaction.editReply({ embeds: [embed], files });
+          await interaction.editReply({ embeds: [embed] });
           break;
         }
 
         default:
           await interaction.editReply({ content: 'Unknown command.' });
       }
+
+      // Record sent message ID for this channel so the next command deletes it
+      if (!isEphemeral) {
+        const reply = await interaction.fetchReply().catch(() => null);
+        if (reply && reply.id) {
+          this.lastChannelMessageIds.set(contextId, reply.id);
+          if (channelId) this.lastChannelMessageIds.set(channelId, reply.id);
+        }
+      }
     } catch (err: any) {
-      // If error is because the message was already deleted (e.g. replaced by newer command), ignore silently
       if (err?.code === 10008 || err?.message?.includes('Unknown Message')) {
         return;
       }
@@ -1163,14 +989,23 @@ export class DiscordBotService {
 
   // Handle Interactive Select Menu Selection for /configure
   private async handleSelectMenu(interaction: StringSelectMenuInteraction) {
+    try {
+      if (!interaction.deferred && !interaction.replied) {
+        await interaction.deferUpdate();
+      }
+    } catch (err: any) {
+      console.warn('[Discord] Could not defer select menu:', err?.message);
+      return;
+    }
+
     const { customId, values, user } = interaction;
     const pending = this.pendingSelections.get(customId);
 
     if (!pending) {
-      await interaction.reply({
+      await interaction.followUp({
         content: '⚠️ This server selection menu has expired. Please run `/configure` again.',
         ephemeral: true,
-      });
+      }).catch(() => {});
       return;
     }
 
@@ -1178,16 +1013,14 @@ export class DiscordBotService {
     const chosenServer = pending.servers.find(s => s.id === selectedId);
 
     if (!chosenServer) {
-      await interaction.reply({
+      await interaction.followUp({
         content: '⚠️ Selected server was not found.',
         ephemeral: true,
-      });
+      }).catch(() => {});
       return;
     }
 
     try {
-      await interaction.deferUpdate();
-
       const canonicalAddr = serverStorage.getCanonicalServerAddress(chosenServer.serverAddress);
 
       serverStorage.setDiscordBinding({
@@ -1237,17 +1070,11 @@ export class DiscordBotService {
             value: '`/status` — Check online status & player count\n`/players` — View online players\n`/start` — Turn on server\n`/stop` — Turn off server\n`/restart` — Reboot server',
           }
         )
-        .setFooter({ text: 'Aternos Command Center', iconURL: this.client.user?.displayAvatarURL() })
+        .setFooter({ text: 'Aternos Command Center' })
         .setTimestamp();
 
-      // Update interaction with no more dropdown components
       await interaction.editReply({ embeds: [embed], components: [] });
       this.pendingSelections.delete(customId);
-
-      // Track completed selection interaction so subsequent command replaces/deletes it
-      this.userLastInteractions.set(user.id, [
-        { interaction, timestamp: Date.now() },
-      ]);
     } catch (err: any) {
       console.error('[Select Menu Error]', err);
     }
@@ -1256,7 +1083,9 @@ export class DiscordBotService {
   public getBotStatus() {
     return {
       isReady: this.isReady,
-      botTag: this.botTag || (this.isReady ? 'Aternos#3859' : 'Connecting...'),
+      currentEnv: CURRENT_ENV,
+      activeTarget: serverStorage.getBotTarget(),
+      botTag: this.botTag || (this.isReady ? 'Aternos#3859' : 'Disconnected'),
       botId: this.botId,
       guildsCount: this.client.guilds?.cache?.size || 0,
       ping: this.client.ws?.ping || this.lastPing || 0,

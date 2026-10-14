@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express from 'express';
 import path from 'path';
 import fs from 'fs';
@@ -15,7 +16,7 @@ const ADMIN_TOKEN = 'shifin-auth-session-key-0508552513';
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = parseInt(process.env.PORT || '3000', 10);
 
   app.use(express.json());
 
@@ -299,6 +300,50 @@ async function startServer() {
     res.json({
       success: true,
       ...discordBot.getBotStatus(),
+    });
+  });
+
+  // Admin Discord bot mode switch (dev vs published)
+  app.get('/api/admin/bot-mode', verifyAdmin, (req, res) => {
+    res.json({
+      success: true,
+      activeTarget: serverStorage.getBotTarget(),
+      currentEnv: discordBot.getBotStatus().currentEnv,
+      isBotRunning: discordBot.getBotStatus().isReady,
+      botTag: discordBot.getBotStatus().botTag,
+    });
+  });
+
+  app.post('/api/admin/bot-mode', verifyAdmin, async (req, res) => {
+    const { target } = req.body || {};
+    if (target !== 'dev' && target !== 'published' && target !== 'disabled') {
+      res.status(400).json({ success: false, message: 'Invalid target. Must be "dev", "published", or "disabled".' });
+      return;
+    }
+
+    await discordBot.setTargetMode(target);
+
+    // Synchronize to peer instance if reachable
+    const devUrl = 'https://ais-dev-4jowc3kk5xlksc4jfq6pf4-142156905058.asia-southeast1.run.app';
+    const publishedUrl = 'https://ais-pre-4jowc3kk5xlksc4jfq6pf4-142156905058.asia-southeast1.run.app';
+    const currentHost = req.get('host') || '';
+    const peerUrl = currentHost.includes('ais-dev') ? publishedUrl : devUrl;
+
+    fetch(`${peerUrl}/api/admin/bot-mode`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-admin-token': ADMIN_TOKEN,
+      },
+      body: JSON.stringify({ target }),
+    }).catch(() => {});
+
+    res.json({
+      success: true,
+      message: `Discord bot target set to "${target.toUpperCase()}". The other instance has been deactivated.`,
+      activeTarget: target,
+      currentEnv: discordBot.getBotStatus().currentEnv,
+      isBotRunning: discordBot.getBotStatus().isReady,
     });
   });
 

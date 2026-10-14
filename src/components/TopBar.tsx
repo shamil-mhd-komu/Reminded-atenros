@@ -103,16 +103,22 @@ export const TopBar: React.FC<TopBarProps> = ({
 
         {/* Action Buttons */}
         <div className="flex items-center gap-2 shrink-0">
-          {isAdminLoggedIn && onOpenAdminPanel && (
+          {(onOpenAdminPanel || onTriggerAdmin) && (
             <motion.button
               whileHover={{ scale: 1.02 }}
               whileTap={{ scale: 0.95 }}
-              onClick={onOpenAdminPanel}
-              className="hidden sm:flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-bold text-emerald-300 bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/30 transition-all cursor-pointer shadow-sm"
+              onClick={() => {
+                if (onOpenAdminPanel) {
+                  onOpenAdminPanel();
+                } else if (onTriggerAdmin) {
+                  onTriggerAdmin();
+                }
+              }}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-bold text-emerald-300 bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/30 transition-all cursor-pointer shadow-sm"
               title="Open Admin Command Center"
             >
               <ShieldCheck className="w-3.5 h-3.5" />
-              <span>Admin Panel</span>
+              <span>Admin</span>
             </motion.button>
           )}
 
@@ -121,7 +127,7 @@ export const TopBar: React.FC<TopBarProps> = ({
               whileHover={{ scale: 1.02 }}
               whileTap={{ scale: 0.95 }}
               onClick={onOpenManageServers}
-              className="flex items-center gap-1.5 px-3.5 py-2 rounded-full text-xs font-medium text-zinc-300 hover:text-white bg-zinc-900/90 hover:bg-zinc-800 border border-white/10 hover:border-white/20 transition-all cursor-pointer shadow-sm"
+              className="flex items-center gap-1.5 px-3 sm:px-3.5 py-1.5 sm:py-2 rounded-full text-xs font-medium text-zinc-300 hover:text-white bg-zinc-900/90 hover:bg-zinc-800 border border-white/10 hover:border-white/20 transition-all cursor-pointer shadow-sm"
               title="Manage Server Profiles"
             >
               <Layers className="w-3.5 h-3.5 text-zinc-400" />
