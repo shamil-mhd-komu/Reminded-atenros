@@ -93,7 +93,7 @@ export class AternosAutomationManager {
     this.curlBinaryPath = path.resolve(process.cwd(), 'bin', 'curl_chrome116');
     this.ensureCurlBinary();
 
-    this.addLog('SYS', 'Aternos Command Center core online. Real Sleeyax AJAX API protocol active.');
+    this.addLog('SYS', 'Apexion Server Core online. High-speed stealth automation active.');
 
     // Initialize with default or persistent config
     const initialConfig = this.loadConfig();

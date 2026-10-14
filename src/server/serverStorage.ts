@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
-import type { ServerProfile, ServerStatus } from '../types/aternos.ts';
+import type { ServerProfile } from '../types/aternos.ts';
+import { redis, DATA_PREFIX, GLOBAL_KEYS, CURRENT_ENV, getRedisJson, setRedisJson } from './redisClient.ts';
 
 export interface StoredServerProfile extends ServerProfile {
   source?: 'web' | 'discord' | 'admin';
@@ -39,8 +40,10 @@ class ServerStorageManager {
   private profiles: Map<string, StoredServerProfile> = new Map();
   private discordBindings: Map<string, DiscordServerBinding> = new Map();
   private discordLogs: DiscordActivityLog[] = [];
-  private botTarget: 'dev' | 'published' | 'disabled' = 'dev';
+  // Default to published in production so apexion.ai.studio is the primary active bot
+  private botTarget: 'dev' | 'published' | 'disabled' = CURRENT_ENV === 'published' ? 'published' : 'published';
   private readonly MAX_LOGS = 100;
+  private isRedisLoaded: boolean = false;
 
   constructor() {
     this.dataDir = path.resolve(process.cwd(), 'data');
@@ -51,6 +54,7 @@ class ServerStorageManager {
 
     this.ensureDataDir();
     this.loadFromDisk();
+    this.initUpstashRedis().catch(() => {});
   }
 
   private ensureDataDir() {
@@ -61,6 +65,81 @@ class ServerStorageManager {
     } catch (err: any) {
       console.warn('Could not create data dir:', err?.message);
     }
+  }
+
+  /**
+   * Load data from Upstash Redis on startup and periodically sync
+   */
+  private async initUpstashRedis() {
+    try {
+      console.log(`[Upstash Redis] Connecting with prefix "${DATA_PREFIX}" (${CURRENT_ENV.toUpperCase()})...`);
+      
+      // 1. Fetch server profiles from Upstash Redis
+      const redisProfiles = await getRedisJson<StoredServerProfile[]>(`${DATA_PREFIX}servers`, []);
+      if (Array.isArray(redisProfiles) && redisProfiles.length > 0) {
+        for (const p of redisProfiles) {
+          if (p.id) this.profiles.set(p.id, p);
+        }
+        console.log(`[Upstash Redis] Restored ${redisProfiles.length} server profile(s) from persistent store.`);
+        this.saveToDisk();
+      } else if (this.profiles.size > 0) {
+        // First boot with existing local data: seed into Upstash
+        await this.syncProfilesToRedis();
+      }
+
+      // 2. Fetch Discord bindings from Upstash Redis
+      const redisBindings = await getRedisJson<DiscordServerBinding[]>(`${DATA_PREFIX}discord_bindings`, []);
+      if (Array.isArray(redisBindings) && redisBindings.length > 0) {
+        for (const b of redisBindings) {
+          if (b.guildIdOrUserId) this.discordBindings.set(b.guildIdOrUserId, b);
+        }
+        console.log(`[Upstash Redis] Restored ${redisBindings.length} Discord binding(s).`);
+        this.saveDiscordBindingsToDisk();
+      } else if (this.discordBindings.size > 0) {
+        await this.syncDiscordBindingsToRedis();
+      }
+
+      // 3. Fetch Discord logs from Upstash Redis
+      const redisLogs = await getRedisJson<DiscordActivityLog[]>(`${DATA_PREFIX}discord_logs`, []);
+      if (Array.isArray(redisLogs) && redisLogs.length > 0) {
+        this.discordLogs = redisLogs;
+      }
+
+      // 4. Fetch global bot mode from Upstash Redis
+      const globalBotMode = await getRedisJson<string>(GLOBAL_KEYS.BOT_MODE, '');
+      if (globalBotMode === 'dev' || globalBotMode === 'published' || globalBotMode === 'disabled') {
+        this.botTarget = globalBotMode;
+        console.log(`[Upstash Redis] Coordinated bot mode is: "${this.botTarget}"`);
+      } else {
+        // Set default to published so apexion.ai.studio is primary
+        await setRedisJson(GLOBAL_KEYS.BOT_MODE, 'published');
+        this.botTarget = 'published';
+      }
+
+      this.isRedisLoaded = true;
+    } catch (err: any) {
+      console.warn('[Upstash Redis] Init sync warning:', err?.message);
+    }
+  }
+
+  private async syncProfilesToRedis() {
+    try {
+      const list = Array.from(this.profiles.values());
+      await setRedisJson(`${DATA_PREFIX}servers`, list);
+    } catch {}
+  }
+
+  private async syncDiscordBindingsToRedis() {
+    try {
+      const list = Array.from(this.discordBindings.values());
+      await setRedisJson(`${DATA_PREFIX}discord_bindings`, list);
+    } catch {}
+  }
+
+  private async syncDiscordLogsToRedis() {
+    try {
+      await setRedisJson(`${DATA_PREFIX}discord_logs`, this.discordLogs);
+    } catch {}
   }
 
   private loadFromDisk() {
@@ -126,7 +205,6 @@ class ServerStorageManager {
       this.ensureDataDir();
       const list = Array.from(this.profiles.values());
       fs.writeFileSync(this.storageFilePath, JSON.stringify(list, null, 2), 'utf-8');
-      // Keep servers-config.json synced as well
       fs.writeFileSync('./servers-config.json', JSON.stringify(list, null, 2), 'utf-8');
     } catch (err: any) {
       console.warn('Could not save server profiles to disk:', err?.message);
@@ -186,6 +264,7 @@ class ServerStorageManager {
     };
     this.profiles.set(id, merged);
     this.saveToDisk();
+    this.syncProfilesToRedis().catch(() => {});
     return merged;
   }
 
@@ -212,6 +291,7 @@ class ServerStorageManager {
       this.profiles.set(id, updated);
     }
     this.saveToDisk();
+    this.syncProfilesToRedis().catch(() => {});
   }
 
   public deleteProfile(id: string): boolean {
@@ -219,10 +299,11 @@ class ServerStorageManager {
     if (!profile) return false;
     this.profiles.delete(profile.id);
     this.saveToDisk();
+    this.syncProfilesToRedis().catch(() => {});
     return true;
   }
 
-  // Canonical server address lookup preserving proper casing (e.g. Bang_Bros_SMP.aternos.me)
+  // Canonical server address lookup preserving proper casing
   public getCanonicalServerAddress(query: string): string {
     if (!query) return 'Bang_Bros_SMP.aternos.me';
     const clean = query.trim();
@@ -265,6 +346,7 @@ class ServerStorageManager {
     const updatedBinding = { ...binding, serverAddress: canonicalAddr };
     this.discordBindings.set(binding.guildIdOrUserId, updatedBinding);
     this.saveDiscordBindingsToDisk();
+    this.syncDiscordBindingsToRedis().catch(() => {});
 
     // Also register or update server profile in general storage
     const id = `discord-${canonicalAddr.replace(/[^a-zA-Z0-9]/g, '-').toLowerCase()}`;
@@ -282,14 +364,10 @@ class ServerStorageManager {
     });
   }
 
-  public getDiscordBinding(guildIdOrUserId: string): DiscordServerBinding | undefined {
-    if (this.discordBindings.has(guildIdOrUserId)) {
-      return this.discordBindings.get(guildIdOrUserId);
-    }
-    // Check if there is any binding configured
-    const all = Array.from(this.discordBindings.values());
-    if (all.length > 0) {
-      return all[0];
+  public getDiscordBinding(id: string): DiscordServerBinding | undefined {
+    if (!id) return undefined;
+    if (this.discordBindings.has(id)) {
+      return this.discordBindings.get(id);
     }
     return undefined;
   }
@@ -310,6 +388,7 @@ class ServerStorageManager {
       this.discordLogs.pop();
     }
     this.saveDiscordLogsToDisk();
+    this.syncDiscordLogsToRedis().catch(() => {});
   }
 
   public getDiscordLogs(): DiscordActivityLog[] {
@@ -321,7 +400,7 @@ class ServerStorageManager {
     return this.botTarget;
   }
 
-  public setBotTarget(target: 'dev' | 'published' | 'disabled', updatedBy: string = 'Admin'): void {
+  public async setBotTarget(target: 'dev' | 'published' | 'disabled', updatedBy: string = 'Admin'): Promise<void> {
     this.botTarget = target;
     try {
       this.ensureDataDir();
@@ -338,8 +417,10 @@ class ServerStorageManager {
         ),
         'utf-8'
       );
+      // Persist globally in Upstash Redis so both dev and published instances see it immediately
+      await setRedisJson(GLOBAL_KEYS.BOT_MODE, target);
     } catch (err: any) {
-      console.warn('Could not save bot mode to disk:', err?.message);
+      console.warn('Could not save bot mode to Upstash/disk:', err?.message);
     }
   }
 }

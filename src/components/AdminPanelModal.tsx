@@ -312,14 +312,14 @@ export const AdminPanelModal: React.FC<AdminPanelModalProps> = ({
             <div className="min-w-0">
               <div className="flex items-center gap-2">
                 <h2 className="text-sm sm:text-base font-bold text-white tracking-tight truncate">
-                  Admin Command Center
+                  Apexion Admin Command Center
                 </h2>
                 <span className="px-2 py-0.5 text-[10px] font-mono font-bold bg-emerald-500/20 text-emerald-300 rounded-md border border-emerald-500/40 shrink-0">
                   ROOT ACCESS
                 </span>
               </div>
               <p className="text-[11px] text-zinc-400 truncate hidden sm:block">
-                Master servers database & multi-instance Discord bot control
+                Apexion master servers database & multi-instance Discord bot control
               </p>
             </div>
           </div>
@@ -421,7 +421,7 @@ export const AdminPanelModal: React.FC<AdminPanelModalProps> = ({
               <span className="text-[9px] text-zinc-400 uppercase font-semibold block leading-tight">Discord Bot</span>
               <p className="text-xs font-bold text-white truncate leading-tight flex items-center gap-1">
                 <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${botStatus?.isReady ? 'bg-emerald-400' : 'bg-amber-400'}`} />
-                <span className="truncate">{botStatus?.botTag || 'Aternos Bot'}</span>
+                <span className="truncate">{botStatus?.botTag || 'Apexion Bot'}</span>
               </p>
             </div>
           </div>
@@ -868,7 +868,7 @@ export const AdminPanelModal: React.FC<AdminPanelModalProps> = ({
                   </div>
                   <div>
                     <h3 className="text-sm font-bold text-white">
-                      {botStatus?.botTag || 'Aternos Bot'}
+                      {botStatus?.botTag || 'Apexion Bot'}
                     </h3>
                     <p className="text-xs text-zinc-400">
                       Guilds: {botStatus?.guildsCount || 0} • Ping: {botStatus?.ping || 0}ms • Current Target:{' '}

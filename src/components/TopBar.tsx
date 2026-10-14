@@ -75,7 +75,7 @@ export const TopBar: React.FC<TopBarProps> = ({
           <div className="flex flex-col min-w-0">
             <div className="flex items-center gap-2">
               <span className="text-sm sm:text-base font-extrabold tracking-tight text-white truncate font-sans">
-                Aternos Cloud
+                Apexion
               </span>
               <span className="hidden sm:inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-semibold font-mono rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
                 <Sparkles className="w-2.5 h-2.5" /> 24/7 AFK

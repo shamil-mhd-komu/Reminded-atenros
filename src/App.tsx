@@ -144,6 +144,47 @@ export default function App() {
     setToasts(prev => prev.filter(t => t.id !== id));
   };
 
+  // Seamlessly restore persisted server profiles from backend (Upstash Redis) on mount
+  useEffect(() => {
+    let isMounted = true;
+    fetch('/api/user/profiles')
+      .then(res => res.json())
+      .then(data => {
+        if (!isMounted) return;
+        const remoteServers = data?.servers;
+        if (Array.isArray(remoteServers) && remoteServers.length > 0) {
+          setServers(prev => {
+            const map = new Map<string, ServerProfile>();
+            // Add existing state profiles
+            for (const s of prev) {
+              if (s && s.id) map.set(s.id, s);
+            }
+            // Add or merge remote persistent profiles
+            for (const s of remoteServers) {
+              if (s && s.id) {
+                const existing = map.get(s.id);
+                map.set(s.id, {
+                  ...existing,
+                  ...s,
+                  sessionCookie: (s.sessionCookie && !s.sessionCookie.includes('...')) ? s.sessionCookie : existing?.sessionCookie || '',
+                });
+              }
+            }
+            const merged = Array.from(map.values());
+            if (merged.length > 0 && !activeServerId) {
+              setActiveServerId(merged[0].id);
+            }
+            return merged;
+          });
+        }
+      })
+      .catch(() => {});
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
   // Persist servers changes to user's localStorage and sync with backend
   useEffect(() => {
     try {

@@ -6,6 +6,7 @@ import { fileURLToPath } from 'url';
 import { aternosService } from './src/server/aternosAutomation.ts';
 import { discordBot } from './src/server/discordBot.ts';
 import { serverStorage } from './src/server/serverStorage.ts';
+import { CURRENT_ENV, DATA_PREFIX } from './src/server/redisClient.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -166,6 +167,16 @@ async function startServer() {
     res.json({ success: true, message: 'Settings updated successfully.' });
   });
 
+  app.get('/api/system/info', (req, res) => {
+    res.json({
+      name: 'Apexion',
+      environment: CURRENT_ENV,
+      storageNamespace: DATA_PREFIX,
+      botStatus: discordBot.getBotStatus(),
+      uptime: process.uptime(),
+    });
+  });
+
   app.post('/api/servers/sync', async (req, res) => {
     const { servers } = req.body || {};
     if (Array.isArray(servers)) {
@@ -173,6 +184,20 @@ async function startServer() {
       await aternosService.syncProfiles(servers);
     }
     res.json({ success: true, count: servers?.length || 0 });
+  });
+
+  app.post('/api/user/sync', async (req, res) => {
+    const { servers } = req.body || {};
+    if (Array.isArray(servers)) {
+      serverStorage.syncFromClient(servers, 'web');
+      await aternosService.syncProfiles(servers);
+    }
+    res.json({ success: true, count: servers?.length || 0 });
+  });
+
+  app.get('/api/user/profiles', (req, res) => {
+    const all = serverStorage.getAllProfiles();
+    res.json({ success: true, servers: all });
   });
 
   app.post('/api/server/detect', async (req, res) => {
@@ -323,24 +348,9 @@ async function startServer() {
 
     await discordBot.setTargetMode(target);
 
-    // Synchronize to peer instance if reachable
-    const devUrl = 'https://ais-dev-4jowc3kk5xlksc4jfq6pf4-142156905058.asia-southeast1.run.app';
-    const publishedUrl = 'https://ais-pre-4jowc3kk5xlksc4jfq6pf4-142156905058.asia-southeast1.run.app';
-    const currentHost = req.get('host') || '';
-    const peerUrl = currentHost.includes('ais-dev') ? publishedUrl : devUrl;
-
-    fetch(`${peerUrl}/api/admin/bot-mode`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-admin-token': ADMIN_TOKEN,
-      },
-      body: JSON.stringify({ target }),
-    }).catch(() => {});
-
     res.json({
       success: true,
-      message: `Discord bot target set to "${target.toUpperCase()}". The other instance has been deactivated.`,
+      message: `Discord bot target globally set to "${target.toUpperCase()}" via Upstash Redis.`,
       activeTarget: target,
       currentEnv: discordBot.getBotStatus().currentEnv,
       isBotRunning: discordBot.getBotStatus().isReady,
@@ -365,13 +375,13 @@ async function startServer() {
     });
   }
 
-  // Start Discord Bot in background
+  // Start Discord Bot in background (checks Upstash Redis leader mode)
   discordBot.start().catch(err => {
-    console.warn('[Discord Bot] Startup warning:', err?.message);
+    console.warn('[Apexion Bot] Startup notice:', err?.message);
   });
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`[Aternos Command Center] Server listening on http://0.0.0.0:${PORT}`);
+    console.log(`[Apexion] Server listening on http://0.0.0.0:${PORT} [${CURRENT_ENV.toUpperCase()}]`);
   });
 }
 

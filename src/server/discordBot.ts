@@ -1,6 +1,4 @@
 import 'dotenv/config';
-import fs from 'fs';
-import path from 'path';
 import {
   Client,
   GatewayIntentBits,
@@ -18,14 +16,10 @@ import { aternosService } from './aternosAutomation.ts';
 import type { AternosState } from '../types/aternos.ts';
 import { serverStorage } from './serverStorage.ts';
 import { queryMinecraftServer, isAternosOfflineIndicator } from './mcPing.ts';
+import { CURRENT_ENV, GLOBAL_KEYS, redis, getRedisJson, setRedisJson } from './redisClient.ts';
 
 const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN || 'MTU1NTMzMDg1Njc1Nzc1NTk5NA.GLEqGe.jXMPh6b0PV8HEOB0sKBRbGTkOTBxgGmiX3tSOQ';
 const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID || '1555330856757755994';
-
-export const IS_PRODUCTION =
-  process.env.NODE_ENV === 'production' ||
-  !fs.existsSync(path.resolve(process.cwd(), 'vite.config.ts'));
-export const CURRENT_ENV: 'dev' | 'published' = IS_PRODUCTION ? 'published' : 'dev';
 
 interface DiscoveredServer {
   id: string;
@@ -38,6 +32,7 @@ interface PendingSession {
   session: string;
   servers: DiscoveredServer[];
   contextId: string;
+  guildId?: string;
   userId: string;
   userName: string;
 }
@@ -50,9 +45,11 @@ export class DiscordBotService {
   private lastPing: number = 0;
   private initError: string | null = null;
   private reconnectTimer: NodeJS.Timeout | null = null;
+  private heartbeatTimer: NodeJS.Timeout | null = null;
   private isExplicitlyStopped: boolean = false;
+  private leaderLeaseTime: number = 0;
 
-  // Track the last message sent in each channel so each new command deletes the previous one
+  // Track the last message sent in each context to prevent channel clutter
   private lastChannelMessageIds: Map<string, string> = new Map();
 
   // Player head emoji cache: playerName.toLowerCase() -> '<:head_name:id>'
@@ -65,15 +62,16 @@ export class DiscordBotService {
     });
 
     this.setupEventHandlers();
+    this.startWatchdog();
   }
 
   private setupEventHandlers() {
     this.client.once('ready', async () => {
       this.isReady = true;
-      this.botTag = this.client.user?.tag || 'Aternos Bot';
+      this.botTag = this.client.user?.tag || 'Apexion Bot';
       this.botId = this.client.user?.id || DISCORD_CLIENT_ID;
       this.lastPing = this.client.ws.ping;
-      console.log(`[Discord Bot (${CURRENT_ENV.toUpperCase()})] Ready as ${this.botTag} (${this.botId})`);
+      console.log(`[Apexion Discord Bot (${CURRENT_ENV.toUpperCase()})] Connected as ${this.botTag} (${this.botId})`);
 
       serverStorage.addDiscordLog({
         user: this.botTag,
@@ -93,32 +91,63 @@ export class DiscordBotService {
       try {
         if (interaction.isChatInputCommand()) {
           this.handleSlashCommand(interaction).catch(err => {
-            console.error('[Slash Command Unhandled]', err);
+            console.error('[Apexion Slash Command Error]', err);
           });
         } else if (interaction.isStringSelectMenu()) {
           this.handleSelectMenu(interaction).catch(err => {
-            console.error('[Select Menu Unhandled]', err);
+            console.error('[Apexion Select Menu Error]', err);
           });
         }
       } catch (err: any) {
-        console.error('[Discord Interaction Event Error]', err);
+        console.error('[Apexion Interaction Event Error]', err);
       }
     });
 
     this.client.on('error', err => {
-      console.error('[Discord Bot Error]', err?.message);
+      console.error('[Apexion Bot Error]', err?.message);
       this.initError = err.message;
     });
 
     this.client.on('shardError', error => {
-      console.warn('[Discord Bot Shard Error]:', error?.message);
+      console.warn('[Apexion Bot Shard Error]:', error?.message);
     });
 
     this.client.on('shardDisconnect', (event, shardId) => {
-      console.warn(`[Discord Bot Shard ${shardId} Disconnected] Code: ${event.code}`);
+      console.warn(`[Apexion Bot Shard ${shardId} Disconnected] Code: ${event.code}`);
       this.isReady = false;
       this.scheduleReconnect();
     });
+  }
+
+  /**
+   * Distributed leader & watchdog loop:
+   * Coordinated via Upstash Redis to ensure Preview (dev) and Published (apexion.ai.studio)
+   * never fight over the bot token or receive conflicting interactions!
+   */
+  private startWatchdog() {
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+
+    this.heartbeatTimer = setInterval(async () => {
+      try {
+        const globalTarget = await getRedisJson<string>(GLOBAL_KEYS.BOT_MODE, 'published');
+        const shouldRunHere = globalTarget === CURRENT_ENV;
+
+        if (shouldRunHere) {
+          if (!this.isReady && !this.isExplicitlyStopped) {
+            console.log(`[Apexion Bot Watchdog] This instance (${CURRENT_ENV}) is designated active. Connecting...`);
+            await this.start().catch(() => {});
+          }
+          // Renew active lease in Upstash Redis (TTL 25s)
+          await setRedisJson(GLOBAL_KEYS.BOT_LEADER, { env: CURRENT_ENV, heartbeat: Date.now() }, 25);
+        } else {
+          // If we are running but mode points to another instance, gracefully disconnect
+          if (this.isReady || this.client.isReady()) {
+            console.log(`[Apexion Bot Watchdog] Active mode is "${globalTarget}". Disconnecting ${CURRENT_ENV} to prevent token collision.`);
+            await this.stop().catch(() => {});
+          }
+        }
+      } catch {}
+    }, 10000);
   }
 
   private scheduleReconnect() {
@@ -130,7 +159,7 @@ export class DiscordBotService {
       if (!this.isReady && !this.isExplicitlyStopped && DISCORD_BOT_TOKEN) {
         const activeTarget = serverStorage.getBotTarget();
         if (activeTarget === CURRENT_ENV) {
-          console.log(`[Discord Bot (${CURRENT_ENV})] Attempting gateway reconnect...`);
+          console.log(`[Apexion Bot (${CURRENT_ENV})] Attempting gateway reconnect...`);
           await this.start().catch(() => {});
         }
       }
@@ -140,28 +169,28 @@ export class DiscordBotService {
   public async start(): Promise<void> {
     const activeTarget = serverStorage.getBotTarget();
     if (activeTarget !== CURRENT_ENV) {
-      console.log(`[Discord Bot] Idle on ${CURRENT_ENV}. Active target is "${activeTarget}". Bot will not connect here.`);
+      console.log(`[Apexion Bot] Standby on ${CURRENT_ENV}. Active target is "${activeTarget}". Bot will not connect here to prevent token collisions.`);
       this.isExplicitlyStopped = true;
       return;
     }
 
     if (!DISCORD_BOT_TOKEN) {
-      console.warn('[Discord Bot] No token provided.');
+      console.warn('[Apexion Bot] No token provided.');
       return;
     }
 
-    if (this.isReady) {
-      console.log(`[Discord Bot (${CURRENT_ENV})] Already running.`);
+    if (this.isReady || this.client.isReady()) {
       return;
     }
 
     try {
       this.isExplicitlyStopped = false;
       this.initError = null;
+      console.log(`[Apexion Bot (${CURRENT_ENV})] Connecting to Discord Gateway...`);
       await this.client.login(DISCORD_BOT_TOKEN);
     } catch (err: any) {
       this.initError = err.message;
-      console.error(`[Discord Bot (${CURRENT_ENV})] Login failed:`, err?.message);
+      console.error(`[Apexion Bot (${CURRENT_ENV})] Login failed:`, err?.message);
       this.scheduleReconnect();
     }
   }
@@ -180,26 +209,26 @@ export class DiscordBotService {
     try {
       this.isReady = false;
       this.client.destroy();
-      console.log(`[Discord Bot (${CURRENT_ENV})] Successfully disconnected and stopped.`);
+      console.log(`[Apexion Bot (${CURRENT_ENV})] Successfully disconnected.`);
       serverStorage.addDiscordLog({
-        user: this.botTag || 'Aternos Bot',
-        command: 'STOP',
+        user: this.botTag || 'Apexion Bot',
+        command: 'STANDBY',
         serverAddress: 'discord.gateway',
         status: 'warning',
-        message: `Bot stopped on ${CURRENT_ENV}`,
+        message: `Bot on standby in ${CURRENT_ENV}`,
       });
     } catch (err: any) {
-      console.warn('[Discord Bot] Error during stop:', err?.message);
+      console.warn('[Apexion Bot] Error during stop:', err?.message);
     }
   }
 
   public async setTargetMode(target: 'dev' | 'published' | 'disabled'): Promise<void> {
-    serverStorage.setBotTarget(target);
+    await serverStorage.setBotTarget(target);
     if (target === CURRENT_ENV) {
-      console.log(`[Discord Bot] Activating on ${CURRENT_ENV}...`);
+      console.log(`[Apexion Bot] Activating on ${CURRENT_ENV}...`);
       await this.start();
     } else {
-      console.log(`[Discord Bot] Deactivating on ${CURRENT_ENV} (target is now ${target})...`);
+      console.log(`[Apexion Bot] Standing down on ${CURRENT_ENV} (target is now ${target})...`);
       await this.stop();
     }
   }
@@ -259,7 +288,7 @@ export class DiscordBotService {
       await rest.put(Routes.applicationCommands(targetId), {
         body: commands.map(cmd => cmd.toJSON()),
       });
-      console.log('[Discord Bot] Global slash commands registered.');
+      console.log('[Apexion Bot] Global slash commands registered.');
 
       // Also register per-guild for instant update in all active guilds
       for (const [guildId] of this.client.guilds.cache) {
@@ -268,12 +297,24 @@ export class DiscordBotService {
         }).catch(() => {});
       }
     } catch (err: any) {
-      console.warn('[Discord Bot] Slash commands registration notice:', err?.message);
+      console.warn('[Apexion Bot] Slash commands registration notice:', err?.message);
     }
   }
 
-  private resolveServerContext(contextId: string, userId?: string) {
+  /**
+   * Resolves server context accurately for multi-user / multi-guild setups.
+   * Ensures bindings configured in a server channel, guild, or DM are correctly found.
+   */
+  private resolveServerContext(contextId: string, userId?: string, guildId?: string | null) {
+    // 1. Channel or direct context binding
     let binding = serverStorage.getDiscordBinding(contextId);
+
+    // 2. Guild binding
+    if (!binding && guildId) {
+      binding = serverStorage.getDiscordBinding(guildId);
+    }
+
+    // 3. User binding
     if (!binding && userId) {
       binding = serverStorage.getDiscordBinding(userId);
     }
@@ -288,25 +329,9 @@ export class DiscordBotService {
       };
     }
 
-    // Check if ANY known server is currently ONLINE in aternosService
-    const allStates = aternosService.getAllStates();
-    const allProfiles = serverStorage.getAllProfiles();
-    for (const p of allProfiles) {
-      const pCanon = serverStorage.getCanonicalServerAddress(p.serverIp || p.name);
-      const st = allStates[pCanon.toLowerCase()] || allStates[p.id];
-      if (st && (st.status === 'online' || st.status === 'starting')) {
-        return {
-          serverAddress: pCanon,
-          sessionCookie: p.sessionCookie,
-          serverCookie: p.serverCookie,
-          profile: p,
-        };
-      }
-    }
-
-    // Check active server configured in aternosService
+    // 4. Check active server configured in aternosService
     const cfg = aternosService.getConfig();
-    if (cfg.serverAddress) {
+    if (cfg.serverAddress && cfg.sessionCookie) {
       const canonical = serverStorage.getCanonicalServerAddress(cfg.serverAddress);
       const profile = serverStorage.getProfile(canonical) || serverStorage.getProfile(cfg.serverAddress);
       return {
@@ -317,7 +342,8 @@ export class DiscordBotService {
       };
     }
 
-    // Fallback to first available profile
+    // 5. Fallback to first available profile in server storage
+    const allProfiles = serverStorage.getAllProfiles();
     if (allProfiles.length > 0) {
       const p = allProfiles[0];
       const canonical = serverStorage.getCanonicalServerAddress(p.serverIp || p.name);
@@ -358,19 +384,19 @@ export class DiscordBotService {
     return '👤';
   }
 
-  // Fast resolution of fresh Aternos + Minecraft live status with strict offline verification
+  // Fast resolution of fresh Aternos + Minecraft live status
   private async getFastServerState(serverAddress: string, sessionCookie?: string) {
     let state: AternosState = aternosService.getState(serverAddress);
 
-    // Sync from Aternos if older than 3s
-    if (sessionCookie || Date.now() - state.lastUpdated > 3000) {
+    // Sync from Aternos if cookie available or older than 3.5s
+    if (sessionCookie || Date.now() - state.lastUpdated > 3500) {
       try {
-        const syncTimeout = new Promise<AternosState>(resolve => setTimeout(() => resolve(state), 2000));
+        const syncTimeout = new Promise<AternosState>(resolve => setTimeout(() => resolve(state), 3500));
         state = await Promise.race([aternosService.syncSessionState(serverAddress), syncTimeout]);
       } catch {}
     }
 
-    // Fast Minecraft server query
+    // Query Minecraft server status
     const live = await queryMinecraftServer(
       serverAddress,
       state.dynip,
@@ -397,7 +423,7 @@ export class DiscordBotService {
     return { state, live };
   }
 
-  // Build clean, polished real-time server status diagnostics embed (NO ASCII ART, NO BIG BOT HEAD)
+  // Build clean, polished real-time server status diagnostics embed
   private buildStatusEmbed(
     serverAddress: string,
     state: any,
@@ -533,42 +559,13 @@ export class DiscordBotService {
       });
     }
 
-    embed.setFooter({ text: 'Aternos Command Center' });
+    embed.setFooter({ text: 'Apexion' });
     embed.setTimestamp();
 
     return embed;
   }
 
-  // Delete previous bot message in channel before sending a new one
-  private async deletePreviousChannelMessage(contextId: string, channel: any) {
-    if (!channel) return;
-
-    try {
-      // 1. Delete message by tracked ID if known
-      const prevMsgId = this.lastChannelMessageIds.get(contextId);
-      if (prevMsgId && 'messages' in channel && typeof channel.messages?.fetch === 'function') {
-        const oldMsg = await channel.messages.fetch(prevMsgId).catch(() => null);
-        if (oldMsg && oldMsg.deletable) {
-          await oldMsg.delete().catch(() => {});
-        }
-      }
-
-      // 2. Sweep recent channel messages to purge any previous messages sent by THIS bot
-      if ('messages' in channel && typeof channel.messages?.fetch === 'function') {
-        const recent = await channel.messages.fetch({ limit: 12 }).catch(() => null);
-        if (recent && recent.size > 0) {
-          const myId = this.client.user?.id;
-          for (const [, msg] of recent) {
-            if (msg.author?.id === myId && msg.id !== prevMsgId && msg.deletable) {
-              await msg.delete().catch(() => {});
-            }
-          }
-        }
-      }
-    } catch {}
-  }
-
-  // Handle Slash Command with immediate deferral, previous message deletion, and zero clutter
+  // Handle Slash Command
   private async handleSlashCommand(interaction: ChatInputCommandInteraction) {
     const { commandName, user, guildId, channelId } = interaction;
     const contextId = channelId || guildId || user.id;
@@ -576,19 +573,14 @@ export class DiscordBotService {
     // /configure contains sensitive session cookie, so it remains ephemeral
     const isEphemeral = commandName === 'configure';
 
-    // 1. Immediately defer within 50ms so Discord never shows "Application did not respond"
+    // 1. Immediately defer within 50ms so Discord never times out
     try {
       if (!interaction.deferred && !interaction.replied) {
         await interaction.deferReply({ ephemeral: isEphemeral });
       }
     } catch (err: any) {
-      console.warn(`[Discord] Could not defer /${commandName}:`, err?.message);
+      console.warn(`[Apexion] Could not defer /${commandName}:`, err?.message);
       return;
-    }
-
-    // 2. Delete previous bot message in this channel before sending the new one
-    if (!isEphemeral && interaction.channel) {
-      await this.deletePreviousChannelMessage(contextId, interaction.channel);
     }
 
     try {
@@ -606,6 +598,8 @@ export class DiscordBotService {
           if (discovered.length === 1) {
             const matchedServer = discovered[0];
             const canonicalAddr = serverStorage.getCanonicalServerAddress(matchedServer.serverAddress);
+            
+            // Save bindings for channel, guild, and user
             serverStorage.setDiscordBinding({
               guildIdOrUserId: contextId,
               serverAddress: canonicalAddr,
@@ -614,6 +608,17 @@ export class DiscordBotService {
               configuredBy: user.username,
               updatedAt: Date.now(),
             });
+
+            if (guildId && guildId !== contextId) {
+              serverStorage.setDiscordBinding({
+                guildIdOrUserId: guildId,
+                serverAddress: canonicalAddr,
+                sessionCookie: session,
+                serverCookie: matchedServer.serverCookie,
+                configuredBy: user.username,
+                updatedAt: Date.now(),
+              });
+            }
 
             if (user.id !== contextId) {
               serverStorage.setDiscordBinding({
@@ -643,7 +648,7 @@ export class DiscordBotService {
             const embed = new EmbedBuilder()
               .setColor(0x10b981)
               .setTitle('⚙️ Aternos Server Configured')
-              .setDescription(`Successfully linked **${canonicalAddr}** to this Discord server.\nYou can now control your server using slash commands.`)
+              .setDescription(`Successfully linked **${canonicalAddr}** to Apexion.\nYou can now control your server using slash commands.`)
               .addFields(
                 { name: '🌐 Server Address', value: `\`${canonicalAddr}\``, inline: true },
                 { name: '🔑 Server ID', value: `\`${matchedServer.id}\``, inline: true },
@@ -653,7 +658,7 @@ export class DiscordBotService {
                   value: '`/status` — Check online status & player count\n`/players` — View online players\n`/start` — Turn on server\n`/stop` — Turn off server\n`/restart` — Reboot server',
                 }
               )
-              .setFooter({ text: 'Aternos Command Center' })
+              .setFooter({ text: 'Apexion' })
               .setTimestamp();
 
             await interaction.editReply({ embeds: [embed] });
@@ -666,7 +671,8 @@ export class DiscordBotService {
               .setTitle('❌ No Aternos Servers Found')
               .setDescription(
                 'Could not locate any servers on this Aternos account.\nPlease make sure your `ATERNOS_SESSION` cookie is copied from your browser while logged into [aternos.org](https://aternos.org/servers/).'
-              );
+              )
+              .setFooter({ text: 'Apexion' });
             await interaction.editReply({ embeds: [embed] });
             return;
           }
@@ -676,6 +682,7 @@ export class DiscordBotService {
             session,
             servers: discovered,
             contextId,
+            guildId: guildId || undefined,
             userId: user.id,
             userName: user.username,
           });
@@ -713,7 +720,7 @@ export class DiscordBotService {
         }
 
         case 'start': {
-          const ctx = this.resolveServerContext(contextId, user.id);
+          const ctx = this.resolveServerContext(contextId, user.id, guildId);
           const { state, live } = await this.getFastServerState(ctx.serverAddress, ctx.sessionCookie);
 
           const isOnline = !isAternosOfflineIndicator(live?.version, live?.motd) && Boolean(live?.online) && state.status !== 'offline';
@@ -728,7 +735,7 @@ export class DiscordBotService {
                 { name: 'Players', value: `\`${live.players?.online || 0}/${live.players?.max || 20}\``, inline: true },
                 { name: 'Tip', value: 'Use `/stop` to shut down, or `/restart` to reboot.', inline: false }
               )
-              .setFooter({ text: 'Aternos Command Center' })
+              .setFooter({ text: 'Apexion' })
               .setTimestamp();
             await interaction.editReply({ embeds: [embed] });
             break;
@@ -740,7 +747,7 @@ export class DiscordBotService {
               .setTitle(`⏳ ${ctx.serverAddress} is Booting Up!`)
               .setDescription(`Server is already in the starting sequence. Please give it 1 to 2 minutes.`)
               .addFields({ name: 'Current Status', value: `🟡 ${state.rawStatus || 'Starting ...'}` })
-              .setFooter({ text: 'Aternos Command Center' })
+              .setFooter({ text: 'Apexion' })
               .setTimestamp();
             await interaction.editReply({ embeds: [embed] });
             break;
@@ -770,7 +777,7 @@ export class DiscordBotService {
                 { name: 'Estimated Time', value: '~60-90 seconds', inline: true },
                 { name: 'Tip', value: 'Run `/status` in a moment to track startup progress.', inline: false }
               )
-              .setFooter({ text: 'Aternos Command Center' })
+              .setFooter({ text: 'Apexion' })
               .setTimestamp();
             await interaction.editReply({ embeds: [embed] });
           } else {
@@ -778,7 +785,7 @@ export class DiscordBotService {
               .setColor(0xef4444)
               .setTitle('❌ Start Command Failed')
               .setDescription(`Aternos rejected the start request:\n\`${res.message}\`\nVerify that your session cookie is valid via \`/configure\`.`)
-              .setFooter({ text: 'Aternos Command Center' })
+              .setFooter({ text: 'Apexion' })
               .setTimestamp();
             await interaction.editReply({ embeds: [embed] });
           }
@@ -786,7 +793,7 @@ export class DiscordBotService {
         }
 
         case 'stop': {
-          const ctx = this.resolveServerContext(contextId, user.id);
+          const ctx = this.resolveServerContext(contextId, user.id, guildId);
           const { state, live } = await this.getFastServerState(ctx.serverAddress, ctx.sessionCookie);
 
           const isOnline = !isAternosOfflineIndicator(live?.version, live?.motd) && (live?.online || state.status === 'online');
@@ -796,7 +803,7 @@ export class DiscordBotService {
               .setColor(0xef4444)
               .setTitle(`⚠️ ${ctx.serverAddress} is Already Offline!`)
               .setDescription(`Cannot stop a server that isn't running.\nUse \`/start\` if you would like to boot it up.`)
-              .setFooter({ text: 'Aternos Command Center' })
+              .setFooter({ text: 'Apexion' })
               .setTimestamp();
             await interaction.editReply({ embeds: [embed] });
             break;
@@ -807,7 +814,7 @@ export class DiscordBotService {
               .setColor(0xf59e0b)
               .setTitle(`⏳ ${ctx.serverAddress} is Shutting Down!`)
               .setDescription(`Server is already shutting down and saving world files.`)
-              .setFooter({ text: 'Aternos Command Center' })
+              .setFooter({ text: 'Apexion' })
               .setTimestamp();
             await interaction.editReply({ embeds: [embed] });
             break;
@@ -833,7 +840,7 @@ export class DiscordBotService {
               .setTitle(`🛑 Stopping ${ctx.serverAddress}`)
               .setDescription(`Stop signal sent to Aternos. World progress is being saved and the server is powering down safely.`)
               .addFields({ name: 'Status', value: '🟠 **Stopping ...**', inline: true })
-              .setFooter({ text: 'Aternos Command Center' })
+              .setFooter({ text: 'Apexion' })
               .setTimestamp();
             await interaction.editReply({ embeds: [embed] });
           } else {
@@ -841,7 +848,7 @@ export class DiscordBotService {
               .setColor(0xef4444)
               .setTitle('❌ Stop Command Failed')
               .setDescription(`Aternos returned: \`${res.message}\``)
-              .setFooter({ text: 'Aternos Command Center' })
+              .setFooter({ text: 'Apexion' })
               .setTimestamp();
             await interaction.editReply({ embeds: [embed] });
           }
@@ -849,7 +856,7 @@ export class DiscordBotService {
         }
 
         case 'restart': {
-          const ctx = this.resolveServerContext(contextId, user.id);
+          const ctx = this.resolveServerContext(contextId, user.id, guildId);
 
           const res = await aternosService.restartServer(ctx.serverAddress, {
             sessionCookie: ctx.sessionCookie,
@@ -862,7 +869,7 @@ export class DiscordBotService {
             .setTitle(res.success ? `🔄 Rebooting ${ctx.serverAddress}` : '❌ Restart Failed')
             .setDescription(`Restart signal sent to Aternos. The server will cycle off and boot back up automatically.`)
             .addFields({ name: 'Result', value: res.message })
-            .setFooter({ text: 'Aternos Command Center' })
+            .setFooter({ text: 'Apexion' })
             .setTimestamp();
 
           await interaction.editReply({ embeds: [embed] });
@@ -870,7 +877,7 @@ export class DiscordBotService {
         }
 
         case 'status': {
-          const ctx = this.resolveServerContext(contextId, user.id);
+          const ctx = this.resolveServerContext(contextId, user.id, guildId);
           const { state, live } = await this.getFastServerState(ctx.serverAddress, ctx.sessionCookie);
 
           const embed = this.buildStatusEmbed(ctx.serverAddress, state, live);
@@ -879,7 +886,7 @@ export class DiscordBotService {
         }
 
         case 'players': {
-          const ctx = this.resolveServerContext(contextId, user.id);
+          const ctx = this.resolveServerContext(contextId, user.id, guildId);
           const { state, live } = await this.getFastServerState(ctx.serverAddress, ctx.sessionCookie);
 
           const isAternosOffline = state.status === 'offline';
@@ -893,7 +900,7 @@ export class DiscordBotService {
               .setColor(0xef4444)
               .setTitle(`🔴 Server is Offline`)
               .setDescription(`**${ctx.serverAddress}** is currently offline. Active players cannot be queried.\nUse \`/start\` to bring the server online!`)
-              .setFooter({ text: 'Aternos Command Center' })
+              .setFooter({ text: 'Apexion' })
               .setTimestamp();
 
             await interaction.editReply({ embeds: [embed] });
@@ -922,7 +929,7 @@ export class DiscordBotService {
               .setColor(0x10b981)
               .setTitle(`👥 No Players Online (0/${max})`)
               .setDescription(`There are currently **0** players connected to **${ctx.serverAddress}**.\nThe server is online and ready for players to join!`)
-              .setFooter({ text: 'Aternos Command Center' })
+              .setFooter({ text: 'Apexion' })
               .setTimestamp();
 
             if (state.countdownActive && typeof state.countdownSeconds === 'number' && state.countdownSeconds > 0) {
@@ -947,7 +954,7 @@ export class DiscordBotService {
             .setColor(0x10b981)
             .setTitle(`👥 Connected Players (${count}/${max})`)
             .setDescription(`Active players currently connected to **${ctx.serverAddress}**:`)
-            .setFooter({ text: 'Aternos Command Center' })
+            .setFooter({ text: 'Apexion' })
             .setTimestamp();
 
           const playerLines = combinedList.map((name, idx) => {
@@ -963,20 +970,8 @@ export class DiscordBotService {
         default:
           await interaction.editReply({ content: 'Unknown command.' });
       }
-
-      // Record sent message ID for this channel so the next command deletes it
-      if (!isEphemeral) {
-        const reply = await interaction.fetchReply().catch(() => null);
-        if (reply && reply.id) {
-          this.lastChannelMessageIds.set(contextId, reply.id);
-          if (channelId) this.lastChannelMessageIds.set(channelId, reply.id);
-        }
-      }
     } catch (err: any) {
-      if (err?.code === 10008 || err?.message?.includes('Unknown Message')) {
-        return;
-      }
-      console.error(`[Discord /${commandName} Error]`, err);
+      console.error(`[Apexion /${commandName} Error]`, err);
       try {
         if (interaction.deferred && !interaction.replied) {
           await interaction.editReply({ content: `❌ Command Error: ${err.message || 'Operation failed'}` });
@@ -994,7 +989,7 @@ export class DiscordBotService {
         await interaction.deferUpdate();
       }
     } catch (err: any) {
-      console.warn('[Discord] Could not defer select menu:', err?.message);
+      console.warn('[Apexion] Could not defer select menu:', err?.message);
       return;
     }
 
@@ -1032,6 +1027,17 @@ export class DiscordBotService {
         updatedAt: Date.now(),
       });
 
+      if (pending.guildId && pending.guildId !== pending.contextId) {
+        serverStorage.setDiscordBinding({
+          guildIdOrUserId: pending.guildId,
+          serverAddress: canonicalAddr,
+          sessionCookie: pending.session,
+          serverCookie: chosenServer.serverCookie,
+          configuredBy: pending.userName,
+          updatedAt: Date.now(),
+        });
+      }
+
       if (pending.userId !== pending.contextId) {
         serverStorage.setDiscordBinding({
           guildIdOrUserId: pending.userId,
@@ -1060,7 +1066,7 @@ export class DiscordBotService {
       const embed = new EmbedBuilder()
         .setColor(0x10b981)
         .setTitle('✅ Aternos Server Linked Successfully')
-        .setDescription(`Successfully linked **${canonicalAddr}** (ID: \`${chosenServer.id}\`) to this Discord server.\nYou can now control your server directly!`)
+        .setDescription(`Successfully linked **${canonicalAddr}** (ID: \`${chosenServer.id}\`) to Apexion.\nYou can now control your server directly!`)
         .addFields(
           { name: '🌐 Server Address', value: `\`${canonicalAddr}\``, inline: true },
           { name: '🔑 Server ID', value: `\`${chosenServer.id}\``, inline: true },
@@ -1070,13 +1076,13 @@ export class DiscordBotService {
             value: '`/status` — Check online status & player count\n`/players` — View online players\n`/start` — Turn on server\n`/stop` — Turn off server\n`/restart` — Reboot server',
           }
         )
-        .setFooter({ text: 'Aternos Command Center' })
+        .setFooter({ text: 'Apexion' })
         .setTimestamp();
 
       await interaction.editReply({ embeds: [embed], components: [] });
       this.pendingSelections.delete(customId);
     } catch (err: any) {
-      console.error('[Select Menu Error]', err);
+      console.error('[Apexion Select Menu Error]', err);
     }
   }
 
@@ -1085,7 +1091,7 @@ export class DiscordBotService {
       isReady: this.isReady,
       currentEnv: CURRENT_ENV,
       activeTarget: serverStorage.getBotTarget(),
-      botTag: this.botTag || (this.isReady ? 'Aternos#3859' : 'Disconnected'),
+      botTag: this.botTag || (this.isReady ? 'Apexion#3859' : 'Standby / Disconnected'),
       botId: this.botId,
       guildsCount: this.client.guilds?.cache?.size || 0,
       ping: this.client.ws?.ping || this.lastPing || 0,
