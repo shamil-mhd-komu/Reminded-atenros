@@ -8,7 +8,7 @@ import { serverStorage } from './serverStorage.ts';
 const DEFAULT_SESSION_CONFIG: SessionConfig = {
   sessionCookie: process.env.ATERNOS_SESSION || '',
   serverCookie: process.env.ATERNOS_SERVER || '',
-  serverAddress: process.env.ATERNOS_SERVER_ADDRESS || 'Bang_Bros_SMP.aternos.me',
+  serverAddress: process.env.ATERNOS_SERVER_ADDRESS || '',
 };
 
 function randomString(length: number): string {
@@ -295,7 +295,7 @@ export class AternosAutomationManager {
         state: {
           status: 'offline',
           rawStatus: 'Offline',
-          serverIp: cfg.serverAddress || 'myserver.aternos.me',
+          serverIp: cfg.serverAddress || '',
           serverPort: cfg.serverPort || '25565',
           software: cfg.software || 'Paper / Bukkit',
           version: cfg.version || '1.20.4',

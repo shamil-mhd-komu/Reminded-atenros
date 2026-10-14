@@ -6,7 +6,7 @@ import { fileURLToPath } from 'url';
 import { aternosService } from './src/server/aternosAutomation.ts';
 import { discordBot } from './src/server/discordBot.ts';
 import { serverStorage } from './src/server/serverStorage.ts';
-import { CURRENT_ENV, DATA_PREFIX } from './src/server/redisClient.ts';
+import { CURRENT_ENV, DATA_PREFIX, getRedisHealth } from './src/server/redisClient.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -25,6 +25,8 @@ async function startServer() {
   app.get('/api/status', (req, res) => {
     const serverParam = (req.query.server as string)?.toLowerCase();
     const shouldRefresh = req.query.refresh === 'true';
+    const token = req.headers['x-admin-token'] || req.query.admin_token;
+    const isAdmin = token === ADMIN_TOKEN;
 
     if (serverParam) {
       if (shouldRefresh) {
@@ -33,7 +35,7 @@ async function startServer() {
       const specificState = aternosService.getState(serverParam);
       res.json({
         ...specificState,
-        allServerStates: aternosService.getAllStates(),
+        allServerStates: isAdmin ? aternosService.getAllStates() : { [serverParam]: specificState },
       });
       return;
     }
@@ -43,10 +45,9 @@ async function startServer() {
     }
 
     const activeState = aternosService.getState();
-    const allServerStates = aternosService.getAllStates();
     res.json({
       ...activeState,
-      allServerStates,
+      allServerStates: isAdmin ? aternosService.getAllStates() : {},
     });
   });
 
@@ -172,11 +173,13 @@ async function startServer() {
     res.json({ success: true, message: 'Settings updated successfully.' });
   });
 
-  app.get('/api/system/info', (req, res) => {
+  app.get('/api/system/info', async (req, res) => {
+    const redisHealth = await getRedisHealth();
     res.json({
       name: 'Apexion',
       environment: CURRENT_ENV,
       storageNamespace: DATA_PREFIX,
+      redisHealth,
       botStatus: discordBot.getBotStatus(),
       uptime: process.uptime(),
     });
@@ -332,9 +335,11 @@ async function startServer() {
   });
 
   // Admin Discord bot status & logs
-  app.get('/api/admin/bot-status', verifyAdmin, (req, res) => {
+  app.get('/api/admin/bot-status', verifyAdmin, async (req, res) => {
+    const redisHealth = await getRedisHealth();
     res.json({
       success: true,
+      redisHealth,
       ...discordBot.getBotStatus(),
     });
   });

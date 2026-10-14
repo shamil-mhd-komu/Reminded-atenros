@@ -49,28 +49,6 @@ const INITIAL_STATE: AternosState = {
 };
 
 export default function App() {
-  // 1. Multi-Server Profiles State
-  const [servers, setServers] = useState<ServerProfile[]>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_SERVERS_KEY);
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          return parsed;
-        }
-      }
-    } catch {}
-    return [];
-  });
-
-  const [activeServerId, setActiveServerId] = useState<string>(() => {
-    try {
-      const savedId = localStorage.getItem(STORAGE_ACTIVE_ID_KEY);
-      if (savedId) return savedId;
-    } catch {}
-    return '';
-  });
-
   // Admin authentication state
   const [isAdminLoginOpen, setIsAdminLoginOpen] = useState(false);
   const [isAdminPanelOpen, setIsAdminPanelOpen] = useState(false);
@@ -87,16 +65,84 @@ export default function App() {
     return '';
   });
 
+  // 1. Multi-Server Profiles State (isolated per user, clean slate for new users)
+  const [servers, setServers] = useState<ServerProfile[]>(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_SERVERS_KEY);
+      const savedAdminToken = localStorage.getItem(STORAGE_ADMIN_TOKEN_KEY);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          // If unauthenticated user, purge any leaked admin servers from earlier sessions
+          if (!savedAdminToken) {
+            const cleaned = parsed.filter(s => {
+              if (!s) return false;
+              const name = String(s.name || s.serverIp || '').toLowerCase();
+              const id = String(s.id || '').toLowerCase();
+              if (
+                name.includes('bang_bros') ||
+                name.includes('bangbros') ||
+                name.includes('narendra') ||
+                id.startsWith('srv-shifin') ||
+                id.startsWith('discord-narendra') ||
+                id.startsWith('discord-bang-bros')
+              ) {
+                return false;
+              }
+              return true;
+            });
+            try {
+              localStorage.setItem(STORAGE_SERVERS_KEY, JSON.stringify(cleaned));
+            } catch {}
+            return cleaned;
+          }
+          return parsed;
+        }
+      }
+    } catch {}
+    return [];
+  });
+
+  const [activeServerId, setActiveServerId] = useState<string>(() => {
+    try {
+      const savedId = localStorage.getItem(STORAGE_ACTIVE_ID_KEY);
+      if (savedId) return savedId;
+    } catch {}
+    return '';
+  });
+
   const activeServer: ServerProfile | null =
-    servers.find(s => s.id === activeServerId) || servers[0] || null;
+    (activeServerId ? servers.find(s => s.id === activeServerId) : null) || servers[0] || null;
 
   // 2. Track real-time live states for server profiles
   const [serverStates, setServerStates] = useState<Record<string, AternosState>>(() => {
     try {
       const saved = localStorage.getItem(STORAGE_SERVER_STATES_KEY);
+      const savedAdminToken = localStorage.getItem(STORAGE_ADMIN_TOKEN_KEY);
       if (saved) {
         const parsed = JSON.parse(saved);
-        if (parsed && typeof parsed === 'object') return parsed;
+        if (parsed && typeof parsed === 'object') {
+          if (!savedAdminToken) {
+            const cleaned: Record<string, AternosState> = {};
+            for (const [k, v] of Object.entries(parsed)) {
+              const lower = k.toLowerCase();
+              if (
+                !lower.includes('bang_bros') &&
+                !lower.includes('bangbros') &&
+                !lower.includes('narendra') &&
+                !lower.startsWith('srv-shifin') &&
+                !lower.startsWith('discord-')
+              ) {
+                cleaned[k] = v as AternosState;
+              }
+            }
+            try {
+              localStorage.setItem(STORAGE_SERVER_STATES_KEY, JSON.stringify(cleaned));
+            } catch {}
+            return cleaned;
+          }
+          return parsed;
+        }
       }
     } catch {}
     return {};
@@ -718,7 +764,13 @@ export default function App() {
         onOpenSettings={() => setIsSettingsOpen(true)}
         onTriggerAdmin={() => setIsAdminLoginOpen(true)}
         isAdminLoggedIn={Boolean(adminToken)}
-        onOpenAdminPanel={() => setIsAdminPanelOpen(true)}
+        onOpenAdminPanel={() => {
+          if (adminToken) {
+            setIsAdminPanelOpen(true);
+          } else {
+            setIsAdminLoginOpen(true);
+          }
+        }}
         activeServerName={activeServer ? (activeServer.serverIp || activeServer.name) : 'No server connected'}
         totalServersCount={servers.length}
         sessionConnected={Boolean(activeServer?.sessionCookie && activeServer.sessionCookie.trim().length > 0)}

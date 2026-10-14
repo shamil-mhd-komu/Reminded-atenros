@@ -26,8 +26,6 @@ import {
 } from 'lucide-react';
 import type { ServerProfile } from '../types/aternos.ts';
 
-const MASTER_ADMIN_TOKEN = 'shifin-auth-session-key-0508552513';
-
 interface AdminPanelModalProps {
   isOpen: boolean;
   onClose: () => void;
@@ -70,11 +68,15 @@ export const AdminPanelModal: React.FC<AdminPanelModalProps> = ({
   const [newVersion, setNewVersion] = useState('1.20.4');
 
   const getEffectiveToken = useCallback(() => {
-    return adminToken || localStorage.getItem('aternos_admin_token') || MASTER_ADMIN_TOKEN;
+    return adminToken || localStorage.getItem('aternos_admin_token') || '';
   }, [adminToken]);
 
   const fetchAdminData = useCallback(async () => {
     const token = getEffectiveToken();
+    if (!token) {
+      setIsAuthLocked(true);
+      return;
+    }
     setIsLoading(true);
     setIsAuthLocked(false);
     try {
@@ -352,12 +354,30 @@ export const AdminPanelModal: React.FC<AdminPanelModalProps> = ({
 
         {/* Global Bot Active Host Quick Switcher Bar */}
         <div className="px-4 sm:px-6 py-2.5 bg-zinc-950/90 border-b border-white/5 flex flex-wrap items-center justify-between gap-2.5 shrink-0">
-          <div className="flex items-center gap-2 min-w-0">
-            <Radio className="w-3.5 h-3.5 text-indigo-400 shrink-0 animate-pulse" />
-            <span className="text-xs font-bold text-white uppercase tracking-wider">Discord Bot Host:</span>
-            <span className="text-xs font-mono font-bold text-emerald-400 bg-emerald-500/15 px-2 py-0.5 rounded border border-emerald-500/30">
-              {botStatus?.activeTarget === 'published' ? '🚀 PUBLISHED CLOUD' : '🛠️ DEV SERVER'}
-            </span>
+          <div className="flex flex-wrap items-center gap-2 sm:gap-4 min-w-0">
+            <div className="flex items-center gap-2 min-w-0">
+              <Radio className="w-3.5 h-3.5 text-indigo-400 shrink-0 animate-pulse" />
+              <span className="text-xs font-bold text-white uppercase tracking-wider">Discord Bot:</span>
+              <span className="text-xs font-mono font-bold text-emerald-400 bg-emerald-500/15 px-2 py-0.5 rounded border border-emerald-500/30">
+                {botStatus?.activeTarget === 'published' ? '🚀 PUBLISHED' : '🛠️ DEV'}
+              </span>
+            </div>
+
+            <div className="flex items-center gap-1.5 min-w-0">
+              <span className="text-xs font-bold text-zinc-400 uppercase tracking-wider">Storage:</span>
+              <span
+                className={`text-[11px] font-mono font-bold px-2 py-0.5 rounded border ${
+                  botStatus?.redisHealth?.status === 'connected'
+                    ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                    : 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                }`}
+                title={botStatus?.redisHealth?.message || 'Storage operational'}
+              >
+                {botStatus?.redisHealth?.status === 'connected'
+                  ? `⚡ UPSTASH REDIS (${botStatus?.redisHealth?.latencyMs ?? 15}ms)`
+                  : '💾 PERSISTENT STORAGE ACTIVE'}
+              </span>
+            </div>
           </div>
 
           <div className="flex items-center gap-1.5">

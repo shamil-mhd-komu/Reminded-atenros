@@ -1,52 +1,257 @@
 // server.ts
+import "dotenv/config";
 import express from "express";
-import path3 from "path";
-import fs3 from "fs";
+import path4 from "path";
+import fs4 from "fs";
 import { fileURLToPath } from "url";
 
 // src/server/aternosAutomation.ts
 import vm from "vm";
 import { exec, execSync } from "child_process";
-import path2 from "path";
-import fs2 from "fs";
+import path3 from "path";
+import fs3 from "fs";
 
 // src/server/serverStorage.ts
+import fs2 from "fs";
+import path2 from "path";
+
+// src/server/redisClient.ts
+import { Redis } from "@upstash/redis";
 import fs from "fs";
 import path from "path";
+function cleanEnv(val, fallback) {
+  if (!val) return fallback;
+  const trimmed = val.trim().replace(/^["']|["']$/g, "");
+  return trimmed.length > 0 ? trimmed : fallback;
+}
+var UPSTASH_URL = cleanEnv(
+  process.env.UPSTASH_REDIS_REST_URL,
+  "https://fond-koi-285614.upstash.io"
+);
+var UPSTASH_TOKEN = cleanEnv(
+  process.env.UPSTASH_REDIS_REST_TOKEN,
+  "gQAAAAAABFuuAAIgcDE4MDFkODk4NWViZDU0ODllOGNhNDkzNmUyODY3ZWM3Mw"
+);
+var inMemoryFallbackStore = /* @__PURE__ */ new Map();
+var redis = new Redis({
+  url: UPSTASH_URL,
+  token: UPSTASH_TOKEN
+});
+function detectEnvironment() {
+  if (process.env.APPLET_ENV === "production" || process.env.NODE_ENV === "production") {
+    return "published";
+  }
+  if (process.env.APPLET_ENV === "dev" || process.env.NODE_ENV === "development") {
+    return "dev";
+  }
+  const hasViteSource = fs.existsSync(path.resolve(process.cwd(), "vite.config.ts"));
+  if (!hasViteSource) {
+    return "published";
+  }
+  return "dev";
+}
+var CURRENT_ENV = detectEnvironment();
+var DATA_PREFIX = CURRENT_ENV === "published" ? "apexion:prod:" : "apexion:dev:";
+var GLOBAL_KEYS = {
+  BOT_MODE: "apexion:global:bot_mode",
+  // 'published' | 'dev' | 'disabled'
+  BOT_LEADER: "apexion:bot:leader_instance"
+  // Holds active leader instance info
+};
+var lastRedisError = null;
+var lastHealthyCheck = 0;
+var isRedisAvailable = true;
+async function getRedisJson(key, defaultValue) {
+  try {
+    const raw = await redis.get(key);
+    isRedisAvailable = true;
+    lastRedisError = null;
+    if (raw === null || raw === void 0) {
+      const cached = inMemoryFallbackStore.get(key);
+      if (cached) {
+        if (!cached.expiresAt || cached.expiresAt > Date.now()) {
+          return cached.value;
+        }
+        inMemoryFallbackStore.delete(key);
+      }
+      return defaultValue;
+    }
+    if (typeof raw === "string") {
+      try {
+        const parsed = JSON.parse(raw);
+        inMemoryFallbackStore.set(key, { value: parsed });
+        return parsed;
+      } catch {
+        inMemoryFallbackStore.set(key, { value: raw });
+        return raw;
+      }
+    }
+    inMemoryFallbackStore.set(key, { value: raw });
+    return raw;
+  } catch (err) {
+    isRedisAvailable = false;
+    lastRedisError = err?.message || "Redis connection failed";
+    const cached = inMemoryFallbackStore.get(key);
+    if (cached) {
+      if (!cached.expiresAt || cached.expiresAt > Date.now()) {
+        return cached.value;
+      }
+      inMemoryFallbackStore.delete(key);
+    }
+    return defaultValue;
+  }
+}
+async function setRedisJson(key, value, ttlSeconds) {
+  const expiresAt = ttlSeconds && ttlSeconds > 0 ? Date.now() + ttlSeconds * 1e3 : void 0;
+  inMemoryFallbackStore.set(key, { value, expiresAt });
+  try {
+    const serialized = typeof value === "string" ? value : JSON.stringify(value);
+    if (ttlSeconds && ttlSeconds > 0) {
+      await redis.set(key, serialized, { ex: ttlSeconds });
+    } else {
+      await redis.set(key, serialized);
+    }
+    isRedisAvailable = true;
+    lastRedisError = null;
+    return true;
+  } catch (err) {
+    isRedisAvailable = false;
+    lastRedisError = err?.message || "Redis write failed";
+    return true;
+  }
+}
+async function getRedisHealth() {
+  const start = Date.now();
+  try {
+    const res = await redis.ping();
+    const latency = Date.now() - start;
+    if (res === "PONG") {
+      isRedisAvailable = true;
+      lastRedisError = null;
+      lastHealthyCheck = Date.now();
+      return {
+        ok: true,
+        status: "connected",
+        message: "Upstash Redis cloud operational",
+        latencyMs: latency
+      };
+    }
+  } catch (err) {
+    isRedisAvailable = false;
+    lastRedisError = err?.message || "Upstash token or connection failure";
+  }
+  return {
+    ok: true,
+    // Still operational via in-memory fallback
+    status: "fallback",
+    message: lastRedisError ? `Local Fallback Active (${lastRedisError})` : "Local Fallback Active"
+  };
+}
+
+// src/server/serverStorage.ts
 var ServerStorageManager = class {
   constructor() {
     this.profiles = /* @__PURE__ */ new Map();
     this.discordBindings = /* @__PURE__ */ new Map();
     this.discordLogs = [];
+    // Default to published in production so apexion.ai.studio is the primary active bot
+    this.botTarget = CURRENT_ENV === "published" ? "published" : "published";
     this.MAX_LOGS = 100;
-    this.dataDir = path.resolve(process.cwd(), "data");
-    this.storageFilePath = path.join(this.dataDir, "admin-servers.json");
-    this.discordBindingsPath = path.join(this.dataDir, "discord-bindings.json");
-    this.discordLogsPath = path.join(this.dataDir, "discord-logs.json");
+    this.isRedisLoaded = false;
+    this.dataDir = path2.resolve(process.cwd(), "data");
+    this.storageFilePath = path2.join(this.dataDir, "admin-servers.json");
+    this.discordBindingsPath = path2.join(this.dataDir, "discord-bindings.json");
+    this.discordLogsPath = path2.join(this.dataDir, "discord-logs.json");
+    this.botModePath = path2.join(this.dataDir, "bot-mode.json");
     this.ensureDataDir();
     this.loadFromDisk();
+    this.initUpstashRedis().catch(() => {
+    });
   }
   ensureDataDir() {
     try {
-      if (!fs.existsSync(this.dataDir)) {
-        fs.mkdirSync(this.dataDir, { recursive: true });
+      if (!fs2.existsSync(this.dataDir)) {
+        fs2.mkdirSync(this.dataDir, { recursive: true });
       }
     } catch (err) {
       console.warn("Could not create data dir:", err?.message);
     }
   }
+  /**
+   * Load data from Upstash Redis on startup and periodically sync
+   */
+  async initUpstashRedis() {
+    try {
+      console.log(`[Upstash Redis] Connecting with prefix "${DATA_PREFIX}" (${CURRENT_ENV.toUpperCase()})...`);
+      const redisProfiles = await getRedisJson(`${DATA_PREFIX}servers`, []);
+      if (Array.isArray(redisProfiles) && redisProfiles.length > 0) {
+        for (const p of redisProfiles) {
+          if (p.id) this.profiles.set(p.id, p);
+        }
+        console.log(`[Upstash Redis] Restored ${redisProfiles.length} server profile(s) from persistent store.`);
+        this.saveToDisk();
+      } else if (this.profiles.size > 0) {
+        await this.syncProfilesToRedis();
+      }
+      const redisBindings = await getRedisJson(`${DATA_PREFIX}discord_bindings`, []);
+      if (Array.isArray(redisBindings) && redisBindings.length > 0) {
+        for (const b of redisBindings) {
+          if (b.guildIdOrUserId) this.discordBindings.set(b.guildIdOrUserId, b);
+        }
+        console.log(`[Upstash Redis] Restored ${redisBindings.length} Discord binding(s).`);
+        this.saveDiscordBindingsToDisk();
+      } else if (this.discordBindings.size > 0) {
+        await this.syncDiscordBindingsToRedis();
+      }
+      const redisLogs = await getRedisJson(`${DATA_PREFIX}discord_logs`, []);
+      if (Array.isArray(redisLogs) && redisLogs.length > 0) {
+        this.discordLogs = redisLogs;
+      }
+      const globalBotMode = await getRedisJson(GLOBAL_KEYS.BOT_MODE, "");
+      if (globalBotMode === "dev" || globalBotMode === "published" || globalBotMode === "disabled") {
+        this.botTarget = globalBotMode;
+        console.log(`[Upstash Redis] Coordinated bot mode is: "${this.botTarget}"`);
+      } else {
+        await setRedisJson(GLOBAL_KEYS.BOT_MODE, "published");
+        this.botTarget = "published";
+      }
+      this.isRedisLoaded = true;
+    } catch (err) {
+      console.warn("[Upstash Redis] Init sync warning:", err?.message);
+    }
+  }
+  async syncProfilesToRedis() {
+    try {
+      const list = Array.from(this.profiles.values());
+      await setRedisJson(`${DATA_PREFIX}servers`, list);
+    } catch {
+    }
+  }
+  async syncDiscordBindingsToRedis() {
+    try {
+      const list = Array.from(this.discordBindings.values());
+      await setRedisJson(`${DATA_PREFIX}discord_bindings`, list);
+    } catch {
+    }
+  }
+  async syncDiscordLogsToRedis() {
+    try {
+      await setRedisJson(`${DATA_PREFIX}discord_logs`, this.discordLogs);
+    } catch {
+    }
+  }
   loadFromDisk() {
     try {
-      if (fs.existsSync(this.storageFilePath)) {
-        const raw = fs.readFileSync(this.storageFilePath, "utf-8");
+      if (fs2.existsSync(this.storageFilePath)) {
+        const raw = fs2.readFileSync(this.storageFilePath, "utf-8");
         const list = JSON.parse(raw);
         if (Array.isArray(list)) {
           for (const item of list) {
             if (item.id) this.profiles.set(item.id, item);
           }
         }
-      } else if (fs.existsSync("./servers-config.json")) {
-        const raw = fs.readFileSync("./servers-config.json", "utf-8");
+      } else if (fs2.existsSync("./servers-config.json")) {
+        const raw = fs2.readFileSync("./servers-config.json", "utf-8");
         const list = JSON.parse(raw);
         if (Array.isArray(list)) {
           for (const item of list) {
@@ -58,8 +263,8 @@ var ServerStorageManager = class {
       console.warn("Could not load stored server profiles:", err?.message);
     }
     try {
-      if (fs.existsSync(this.discordBindingsPath)) {
-        const raw = fs.readFileSync(this.discordBindingsPath, "utf-8");
+      if (fs2.existsSync(this.discordBindingsPath)) {
+        const raw = fs2.readFileSync(this.discordBindingsPath, "utf-8");
         const list = JSON.parse(raw);
         if (Array.isArray(list)) {
           for (const item of list) {
@@ -70,11 +275,18 @@ var ServerStorageManager = class {
     } catch {
     }
     try {
-      if (fs.existsSync(this.discordLogsPath)) {
-        const raw = fs.readFileSync(this.discordLogsPath, "utf-8");
+      if (fs2.existsSync(this.discordLogsPath)) {
+        const raw = fs2.readFileSync(this.discordLogsPath, "utf-8");
         const list = JSON.parse(raw);
         if (Array.isArray(list)) {
           this.discordLogs = list;
+        }
+      }
+      if (fs2.existsSync(this.botModePath)) {
+        const raw = fs2.readFileSync(this.botModePath, "utf-8");
+        const parsed = JSON.parse(raw);
+        if (parsed?.activeTarget === "dev" || parsed?.activeTarget === "published" || parsed?.activeTarget === "disabled") {
+          this.botTarget = parsed.activeTarget;
         }
       }
     } catch {
@@ -84,8 +296,7 @@ var ServerStorageManager = class {
     try {
       this.ensureDataDir();
       const list = Array.from(this.profiles.values());
-      fs.writeFileSync(this.storageFilePath, JSON.stringify(list, null, 2), "utf-8");
-      fs.writeFileSync("./servers-config.json", JSON.stringify(list, null, 2), "utf-8");
+      fs2.writeFileSync(this.storageFilePath, JSON.stringify(list, null, 2), "utf-8");
     } catch (err) {
       console.warn("Could not save server profiles to disk:", err?.message);
     }
@@ -94,14 +305,14 @@ var ServerStorageManager = class {
     try {
       this.ensureDataDir();
       const list = Array.from(this.discordBindings.values());
-      fs.writeFileSync(this.discordBindingsPath, JSON.stringify(list, null, 2), "utf-8");
+      fs2.writeFileSync(this.discordBindingsPath, JSON.stringify(list, null, 2), "utf-8");
     } catch {
     }
   }
   saveDiscordLogsToDisk() {
     try {
       this.ensureDataDir();
-      fs.writeFileSync(this.discordLogsPath, JSON.stringify(this.discordLogs, null, 2), "utf-8");
+      fs2.writeFileSync(this.discordLogsPath, JSON.stringify(this.discordLogs, null, 2), "utf-8");
     } catch {
     }
   }
@@ -133,6 +344,8 @@ var ServerStorageManager = class {
     };
     this.profiles.set(id, merged);
     this.saveToDisk();
+    this.syncProfilesToRedis().catch(() => {
+    });
     return merged;
   }
   syncFromClient(clientProfiles, source = "web") {
@@ -156,17 +369,21 @@ var ServerStorageManager = class {
       this.profiles.set(id, updated);
     }
     this.saveToDisk();
+    this.syncProfilesToRedis().catch(() => {
+    });
   }
   deleteProfile(id) {
     const profile = this.getProfile(id);
     if (!profile) return false;
     this.profiles.delete(profile.id);
     this.saveToDisk();
+    this.syncProfilesToRedis().catch(() => {
+    });
     return true;
   }
-  // Canonical server address lookup preserving proper casing (e.g. Bang_Bros_SMP.aternos.me)
+  // Canonical server address lookup preserving proper casing
   getCanonicalServerAddress(query) {
-    if (!query) return "Bang_Bros_SMP.aternos.me";
+    if (!query) return "";
     const clean = query.trim();
     const normalize = (s) => s.toLowerCase().replace(/[-_\s]/g, "").replace(/\.aternos\.me$/i, "");
     const norm = normalize(clean);
@@ -194,6 +411,8 @@ var ServerStorageManager = class {
     const updatedBinding = { ...binding, serverAddress: canonicalAddr };
     this.discordBindings.set(binding.guildIdOrUserId, updatedBinding);
     this.saveDiscordBindingsToDisk();
+    this.syncDiscordBindingsToRedis().catch(() => {
+    });
     const id = `discord-${canonicalAddr.replace(/[^a-zA-Z0-9]/g, "-").toLowerCase()}`;
     this.saveProfile({
       id,
@@ -208,13 +427,10 @@ var ServerStorageManager = class {
       discordUser: binding.configuredBy
     });
   }
-  getDiscordBinding(guildIdOrUserId) {
-    if (this.discordBindings.has(guildIdOrUserId)) {
-      return this.discordBindings.get(guildIdOrUserId);
-    }
-    const all = Array.from(this.discordBindings.values());
-    if (all.length > 0) {
-      return all[0];
+  getDiscordBinding(id) {
+    if (!id) return void 0;
+    if (this.discordBindings.has(id)) {
+      return this.discordBindings.get(id);
     }
     return void 0;
   }
@@ -233,9 +449,37 @@ var ServerStorageManager = class {
       this.discordLogs.pop();
     }
     this.saveDiscordLogsToDisk();
+    this.syncDiscordLogsToRedis().catch(() => {
+    });
   }
   getDiscordLogs() {
     return [...this.discordLogs];
+  }
+  // Discord Bot Active Instance Target ('dev' | 'published' | 'disabled')
+  getBotTarget() {
+    return this.botTarget;
+  }
+  async setBotTarget(target, updatedBy = "Admin") {
+    this.botTarget = target;
+    try {
+      this.ensureDataDir();
+      fs2.writeFileSync(
+        this.botModePath,
+        JSON.stringify(
+          {
+            activeTarget: target,
+            updatedAt: Date.now(),
+            updatedBy
+          },
+          null,
+          2
+        ),
+        "utf-8"
+      );
+      await setRedisJson(GLOBAL_KEYS.BOT_MODE, target);
+    } catch (err) {
+      console.warn("Could not save bot mode to Upstash/disk:", err?.message);
+    }
   }
 };
 var serverStorage = new ServerStorageManager();
@@ -244,7 +488,7 @@ var serverStorage = new ServerStorageManager();
 var DEFAULT_SESSION_CONFIG = {
   sessionCookie: process.env.ATERNOS_SESSION || "",
   serverCookie: process.env.ATERNOS_SERVER || "",
-  serverAddress: process.env.ATERNOS_SERVER_ADDRESS || "Bang_Bros_SMP.aternos.me"
+  serverAddress: process.env.ATERNOS_SERVER_ADDRESS || ""
 };
 function randomString(length) {
   const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
@@ -307,9 +551,9 @@ var AternosAutomationManager = class {
     this.MAX_LOGS = 120;
     this.inFlightSyncs = /* @__PURE__ */ new Map();
     this.macroRules = JSON.parse(JSON.stringify(DEFAULT_MACRO_RULES));
-    this.curlBinaryPath = path2.resolve(process.cwd(), "bin", "curl_chrome116");
+    this.curlBinaryPath = path3.resolve(process.cwd(), "bin", "curl_chrome116");
     this.ensureCurlBinary();
-    this.addLog("SYS", "Aternos Command Center core online. Real Sleeyax AJAX API protocol active.");
+    this.addLog("SYS", "Apexion Server Core online. High-speed stealth automation active.");
     const initialConfig = this.loadConfig();
     if (initialConfig.serverAddress) {
       this.activeSessionKey = initialConfig.serverAddress.toLowerCase();
@@ -331,24 +575,24 @@ var AternosAutomationManager = class {
   }
   ensureCurlBinary() {
     try {
-      if (!fs2.existsSync(this.curlBinaryPath)) {
-        const binDir2 = path2.dirname(this.curlBinaryPath);
-        if (!fs2.existsSync(binDir2)) {
-          fs2.mkdirSync(binDir2, { recursive: true });
+      if (!fs3.existsSync(this.curlBinaryPath)) {
+        const binDir2 = path3.dirname(this.curlBinaryPath);
+        if (!fs3.existsSync(binDir2)) {
+          fs3.mkdirSync(binDir2, { recursive: true });
         }
         execSync(
           'curl -sL "https://github.com/lwthiker/curl-impersonate/releases/download/v0.6.1/curl-impersonate-v0.6.1.x86_64-linux-gnu.tar.gz" | tar -xz -C ./bin',
           { stdio: "ignore" }
         );
       }
-      if (fs2.existsSync(this.curlBinaryPath)) {
-        fs2.chmodSync(this.curlBinaryPath, 493);
+      if (fs3.existsSync(this.curlBinaryPath)) {
+        fs3.chmodSync(this.curlBinaryPath, 493);
       }
-      const binDir = path2.dirname(this.curlBinaryPath);
-      if (fs2.existsSync(binDir)) {
-        for (const file of fs2.readdirSync(binDir)) {
+      const binDir = path3.dirname(this.curlBinaryPath);
+      if (fs3.existsSync(binDir)) {
+        for (const file of fs3.readdirSync(binDir)) {
           try {
-            fs2.chmodSync(path2.join(binDir, file), 493);
+            fs3.chmodSync(path3.join(binDir, file), 493);
           } catch {
           }
         }
@@ -359,8 +603,8 @@ var AternosAutomationManager = class {
   }
   loadConfig() {
     try {
-      if (fs2.existsSync("./session-config.json")) {
-        const raw = fs2.readFileSync("./session-config.json", "utf-8");
+      if (fs3.existsSync("./session-config.json")) {
+        const raw = fs3.readFileSync("./session-config.json", "utf-8");
         return JSON.parse(raw);
       }
     } catch {
@@ -369,8 +613,8 @@ var AternosAutomationManager = class {
   }
   loadMacrosConfig() {
     try {
-      if (fs2.existsSync("./macros-config.json")) {
-        const raw = fs2.readFileSync("./macros-config.json", "utf-8");
+      if (fs3.existsSync("./macros-config.json")) {
+        const raw = fs3.readFileSync("./macros-config.json", "utf-8");
         const parsed = JSON.parse(raw);
         if (Array.isArray(parsed) && parsed.length > 0) {
           this.macroRules = parsed;
@@ -382,14 +626,14 @@ var AternosAutomationManager = class {
   }
   saveMacrosConfig() {
     try {
-      fs2.writeFileSync("./macros-config.json", JSON.stringify(this.macroRules, null, 2), "utf-8");
+      fs3.writeFileSync("./macros-config.json", JSON.stringify(this.macroRules, null, 2), "utf-8");
     } catch {
     }
   }
   loadServersConfig() {
     try {
-      if (fs2.existsSync("./servers-config.json")) {
-        const raw = fs2.readFileSync("./servers-config.json", "utf-8");
+      if (fs3.existsSync("./servers-config.json")) {
+        const raw = fs3.readFileSync("./servers-config.json", "utf-8");
         const list = JSON.parse(raw);
         if (Array.isArray(list)) {
           for (const s of list) {
@@ -415,8 +659,8 @@ var AternosAutomationManager = class {
   }
   getServersList() {
     try {
-      if (fs2.existsSync("./servers-config.json")) {
-        const raw = fs2.readFileSync("./servers-config.json", "utf-8");
+      if (fs3.existsSync("./servers-config.json")) {
+        const raw = fs3.readFileSync("./servers-config.json", "utf-8");
         const list = JSON.parse(raw);
         if (Array.isArray(list) && list.length > 0) {
           return list;
@@ -482,7 +726,7 @@ var AternosAutomationManager = class {
         state: {
           status: "offline",
           rawStatus: "Offline",
-          serverIp: cfg.serverAddress || "myserver.aternos.me",
+          serverIp: cfg.serverAddress || "",
           serverPort: cfg.serverPort || "25565",
           software: cfg.software || "Paper / Bukkit",
           version: cfg.version || "1.20.4",
@@ -680,7 +924,7 @@ var AternosAutomationManager = class {
   async executeChromeRequest(url, cookies, headers = {}) {
     const cookieStr = cookies.join("; ");
     const headerFlags = Object.entries(headers).map(([k, v]) => `-H "${k}: ${v}"`).join(" ");
-    const binary = fs2.existsSync(this.curlBinaryPath) ? this.curlBinaryPath : "./bin/curl_chrome116";
+    const binary = fs3.existsSync(this.curlBinaryPath) ? this.curlBinaryPath : "./bin/curl_chrome116";
     const cmd = `${binary} -sL "${url}" -H "Cookie: ${cookieStr}" ${headerFlags}`;
     return new Promise((resolve, reject) => {
       exec(cmd, { encoding: "utf-8", maxBuffer: 20 * 1024 * 1024, timeout: 15e3 }, (err, stdout) => {
@@ -865,6 +1109,10 @@ var AternosAutomationManager = class {
       inst.state.countdownActive = false;
       inst.state.countdownSeconds = null;
       inst.state.countdownFormatted = null;
+      inst.state.canExtend = false;
+      inst.state.playersOnline = 0;
+      inst.state.playerList = [];
+      inst.state.dynip = void 0;
     }
     if (lastStatus.slots !== void 0) inst.state.maxPlayers = Number(lastStatus.slots);
     if (lastStatus.players !== void 0) inst.state.playersOnline = Number(lastStatus.players);
@@ -1417,19 +1665,14 @@ var AternosAutomationManager = class {
       if (inst.state.status === "online") {
         const players = inst.state.playersOnline ?? 0;
         if (players === 0) {
-          if (inst.state.countdownSeconds === null || inst.state.countdownSeconds === void 0) {
-            inst.state.countdownSeconds = 360;
-          }
-          if (inst.state.countdownSeconds > 0) {
-            inst.state.countdownActive = true;
+          if (inst.state.countdownActive && typeof inst.state.countdownSeconds === "number" && inst.state.countdownSeconds > 0) {
             inst.state.countdownSeconds -= 1;
             const m = Math.floor(inst.state.countdownSeconds / 60);
             const s = inst.state.countdownSeconds % 60;
             inst.state.countdownFormatted = `${m}:${s < 10 ? "0" : ""}${s}`;
             inst.state.canExtend = inst.state.countdownSeconds <= 60;
-          } else {
+          } else if (inst.state.countdownSeconds === 0) {
             inst.state.countdownActive = false;
-            inst.state.countdownSeconds = 0;
             inst.state.countdownFormatted = "0:00";
             inst.state.canExtend = false;
           }
@@ -1438,6 +1681,9 @@ var AternosAutomationManager = class {
         }
       } else {
         inst.state.countdownActive = false;
+        inst.state.countdownSeconds = null;
+        inst.state.countdownFormatted = null;
+        inst.state.canExtend = false;
       }
     }
   }
@@ -1559,6 +1805,7 @@ var AternosAutomationManager = class {
 var aternosService = new AternosAutomationManager();
 
 // src/server/discordBot.ts
+import "dotenv/config";
 import {
   Client,
   GatewayIntentBits,
@@ -1570,7 +1817,6 @@ import {
   StringSelectMenuBuilder,
   StringSelectMenuOptionBuilder
 } from "discord.js";
-import sharp from "sharp";
 
 // src/server/mcPing.ts
 import net from "net";
@@ -1608,6 +1854,16 @@ function createPacket(packetId, data) {
   const idBuf = writeVarInt(packetId);
   const lengthBuf = writeVarInt(idBuf.length + data.length);
   return Buffer.concat([lengthBuf, idBuf, data]);
+}
+function isAternosOfflineIndicator(versionName, motdClean, protocolVersion) {
+  const v = (versionName || "").toLowerCase().trim();
+  const m = (motdClean || "").toLowerCase().trim();
+  if (protocolVersion === -1) return true;
+  if (v.includes("offline") || v.includes("\u25CF offline") || v === "offline" || v === "\u25CF") return true;
+  if (m.includes("server is offline") || m.includes("this server is offline") || m.includes("get this server more ram") || m.includes("\u25CF offline") || m.includes("offline server")) {
+    return true;
+  }
+  return false;
 }
 async function pingMinecraftDirect(host, port = 25565, timeoutMs = 900) {
   return new Promise((resolve) => {
@@ -1670,6 +1926,19 @@ async function pingMinecraftDirect(host, port = 25565, timeoutMs = 900) {
                 offset += stringLenSize;
                 const jsonStr = receivedBuffer.toString("utf8", offset, offset + stringLen);
                 const data = JSON.parse(jsonStr);
+                const verName = data.version?.name || "";
+                const motdText = typeof data.description === "string" ? data.description : data.description?.text || "";
+                const protocol = data.version?.protocol;
+                if (isAternosOfflineIndicator(verName, motdText, protocol)) {
+                  cleanup();
+                  resolve({
+                    online: false,
+                    players: { online: 0, max: 20, list: [] },
+                    version: verName,
+                    motd: motdText
+                  });
+                  return;
+                }
                 const sample = Array.isArray(data.players?.sample) ? data.players.sample : [];
                 const list = sample.map((p) => ({
                   name: p.name,
@@ -1684,8 +1953,8 @@ async function pingMinecraftDirect(host, port = 25565, timeoutMs = 900) {
                     max: data.players?.max || 20,
                     list
                   },
-                  version: data.version?.name,
-                  motd: typeof data.description === "string" ? data.description : data.description?.text
+                  version: verName,
+                  motd: motdText
                 });
               }
             }
@@ -1730,7 +1999,7 @@ async function queryMinecraftServer(serverAddress, dynip, fallbackCount = 0, fal
   const cacheKey = `${serverAddress}_${dynip || ""}`.toLowerCase();
   const cached = pingCache.get(cacheKey);
   const now = Date.now();
-  if (cached && now - cached.time < 6e3) {
+  if (cached && now - cached.time < 5e3) {
     return cached.result;
   }
   const existingInFlight = inFlightPings.get(cacheKey);
@@ -1751,7 +2020,7 @@ async function queryMinecraftServer(serverAddress, dynip, fallbackCount = 0, fal
       if (serverAddress && serverAddress.trim()) targets.push(parseAddress(serverAddress.trim()));
       const tasks = [];
       for (const t of targets) {
-        tasks.push(pingMinecraftDirect(t.host, t.port, 1500));
+        tasks.push(pingMinecraftDirect(t.host, t.port, 1200));
       }
       for (const t of targets) {
         const targetStr = t.port === 25565 ? t.host : `${t.host}:${t.port}`;
@@ -1759,7 +2028,7 @@ async function queryMinecraftServer(serverAddress, dynip, fallbackCount = 0, fal
           (async () => {
             try {
               const ac = new AbortController();
-              const tm = setTimeout(() => ac.abort(), 3e3);
+              const tm = setTimeout(() => ac.abort(), 2500);
               const res = await fetch(`https://api.mcstatus.io/v2/status/java/${encodeURIComponent(targetStr)}`, {
                 signal: ac.signal
               });
@@ -1767,6 +2036,17 @@ async function queryMinecraftServer(serverAddress, dynip, fallbackCount = 0, fal
               if (res.ok) {
                 const data = await res.json();
                 if (data?.online) {
+                  const verName = data.version?.name_clean || data.version?.name_raw || "";
+                  const motdClean = data.motd?.clean || "";
+                  const proto = data.version?.protocol;
+                  if (isAternosOfflineIndicator(verName, motdClean, proto)) {
+                    return {
+                      online: false,
+                      players: { online: 0, max: 20, list: [] },
+                      version: verName,
+                      motd: motdClean
+                    };
+                  }
                   const rawList = Array.isArray(data.players?.list) ? data.players.list : [];
                   const list = rawList.map((p) => {
                     const name = typeof p === "string" ? p : p.name_clean || p.name_raw || p.name || "";
@@ -1783,8 +2063,8 @@ async function queryMinecraftServer(serverAddress, dynip, fallbackCount = 0, fal
                       max: data.players?.max || 20,
                       list
                     },
-                    version: data.version?.name_clean || data.version?.name_raw,
-                    motd: data.motd?.clean
+                    version: verName,
+                    motd: motdClean
                   };
                 }
               }
@@ -1800,7 +2080,7 @@ async function queryMinecraftServer(serverAddress, dynip, fallbackCount = 0, fal
           (async () => {
             try {
               const ac = new AbortController();
-              const tm = setTimeout(() => ac.abort(), 3e3);
+              const tm = setTimeout(() => ac.abort(), 2500);
               const res = await fetch(`https://api.mcsrvstat.us/3/${encodeURIComponent(targetStr)}`, {
                 signal: ac.signal
               });
@@ -1808,6 +2088,17 @@ async function queryMinecraftServer(serverAddress, dynip, fallbackCount = 0, fal
               if (res.ok) {
                 const data = await res.json();
                 if (data?.online) {
+                  const verName = String(data.version || "");
+                  const motdClean = Array.isArray(data.motd?.clean) ? data.motd.clean.join(" ") : String(data.motd?.clean || "");
+                  const proto = data.protocol?.version;
+                  if (isAternosOfflineIndicator(verName, motdClean, proto)) {
+                    return {
+                      online: false,
+                      players: { online: 0, max: 20, list: [] },
+                      version: verName,
+                      motd: motdClean
+                    };
+                  }
                   const rawList = Array.isArray(data.players?.list) ? data.players.list : [];
                   const list = rawList.map((p) => {
                     const name = typeof p === "string" ? p : p.name || p.name_clean || "";
@@ -1824,8 +2115,8 @@ async function queryMinecraftServer(serverAddress, dynip, fallbackCount = 0, fal
                       max: data.players?.max || 20,
                       list
                     },
-                    version: data.version,
-                    motd: Array.isArray(data.motd?.clean) ? data.motd.clean.join(" ") : data.motd?.clean
+                    version: verName,
+                    motd: motdClean
                   };
                 }
               }
@@ -1837,6 +2128,17 @@ async function queryMinecraftServer(serverAddress, dynip, fallbackCount = 0, fal
       }
       try {
         const results = await Promise.all(tasks);
+        const hasExplicitOffline = results.some((r) => r && !r.online && isAternosOfflineIndicator(r.version, r.motd));
+        if (hasExplicitOffline) {
+          const offlineRes = {
+            online: false,
+            players: { online: 0, max: 20, list: [] },
+            version: "\u25CF Offline",
+            motd: "This server is offline."
+          };
+          pingCache.set(cacheKey, { time: now, result: offlineRes });
+          return offlineRes;
+        }
         const onlineResult = results.find((r) => r && r.online);
         if (onlineResult) {
           const existingNames = new Set(onlineResult.players.list.map((p) => p.name.toLowerCase()));
@@ -1854,18 +2156,17 @@ async function queryMinecraftServer(serverAddress, dynip, fallbackCount = 0, fal
         }
       } catch {
       }
-      const isServerOnline = fallbackOnline || fallbackCount > 0 || fallbackPlayerList.length > 0;
-      const listFromFallback = fallbackPlayerList.map((name) => ({
-        name,
-        avatarUrl: `https://minotar.net/helm/${encodeURIComponent(name)}/32.png`
-      }));
+      const isServerOnline = false;
+      const listFromFallback = [];
       const fallbackResult = {
-        online: isServerOnline,
+        online: false,
         players: {
-          online: Math.max(fallbackCount, listFromFallback.length),
+          online: 0,
           max: 20,
-          list: listFromFallback
-        }
+          list: []
+        },
+        version: "\u25CF Offline",
+        motd: "This server is offline."
       };
       pingCache.set(cacheKey, { time: now, result: fallbackResult });
       return fallbackResult;
@@ -1879,7 +2180,7 @@ async function queryMinecraftServer(serverAddress, dynip, fallbackCount = 0, fal
 
 // src/server/discordBot.ts
 var DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN || "MTU1NTMzMDg1Njc1Nzc1NTk5NA.GLEqGe.jXMPh6b0PV8HEOB0sKBRbGTkOTBxgGmiX3tSOQ";
-var DISCORD_CLIENT_ID = "1555330856757755994";
+var DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID || "1555330856757755994";
 var DiscordBotService = class {
   constructor() {
     this.isReady = false;
@@ -1887,69 +2188,173 @@ var DiscordBotService = class {
     this.botId = "";
     this.lastPing = 0;
     this.initError = null;
+    this.reconnectTimer = null;
+    this.heartbeatTimer = null;
+    this.isExplicitlyStopped = false;
+    this.leaderLeaseTime = 0;
+    // Track the last message sent in each context to prevent channel clutter
+    this.lastChannelMessageIds = /* @__PURE__ */ new Map();
+    // Track the last interaction reply per user to delete their previous message
+    this.lastUserReplies = /* @__PURE__ */ new Map();
     // Player head emoji cache: playerName.toLowerCase() -> '<:head_name:id>'
     this.playerEmojiCache = /* @__PURE__ */ new Map();
-    this.canCreateApplicationEmojis = true;
-    this.emojiQueue = [];
-    this.isProcessingEmojiQueue = false;
-    // Pending server selections for /configure
     this.pendingSelections = /* @__PURE__ */ new Map();
-    // Track previous interactions per user to delete older messages when a new command is run
-    this.userLastInteractions = /* @__PURE__ */ new Map();
     this.client = new Client({
-      intents: [
-        GatewayIntentBits.Guilds
-      ]
+      intents: [GatewayIntentBits.Guilds]
     });
     this.setupEventHandlers();
+    this.startWatchdog();
   }
   setupEventHandlers() {
     this.client.once("ready", async () => {
       this.isReady = true;
-      this.botTag = this.client.user?.tag || "Aternos Bot";
+      this.botTag = this.client.user?.tag || "Apexion Bot";
       this.botId = this.client.user?.id || DISCORD_CLIENT_ID;
       this.lastPing = this.client.ws.ping;
-      console.log(`[Discord Bot] Ready as ${this.botTag} (${this.botId})`);
+      console.log(`[Apexion Discord Bot (${CURRENT_ENV.toUpperCase()})] Connected as ${this.botTag} (${this.botId})`);
       serverStorage.addDiscordLog({
         user: this.botTag,
         command: "READY",
         serverAddress: "discord.gateway",
         status: "success",
-        message: `Connected in ${this.client.guilds.cache.size} server(s)`
+        message: `Connected in ${this.client.guilds.cache.size} server(s) [${CURRENT_ENV.toUpperCase()}]`
       });
-      await this.loadExistingApplicationEmojis();
-      await this.registerSlashCommands();
+      await this.loadExistingApplicationEmojis().catch(() => {
+      });
+      await this.registerSlashCommands().catch(() => {
+      });
     });
     this.client.on("interactionCreate", async (interaction) => {
       try {
         if (interaction.isChatInputCommand()) {
           this.handleSlashCommand(interaction).catch((err) => {
-            console.error("[Slash Command Unhandled]", err);
+            console.error("[Apexion Slash Command Error]", err);
           });
         } else if (interaction.isStringSelectMenu()) {
           this.handleSelectMenu(interaction).catch((err) => {
-            console.error("[Select Menu Unhandled]", err);
+            console.error("[Apexion Select Menu Error]", err);
           });
         }
       } catch (err) {
-        console.error("[Discord Interaction Event Error]", err);
+        console.error("[Apexion Interaction Event Error]", err);
       }
     });
     this.client.on("error", (err) => {
-      console.error("[Discord Bot Error]", err?.message);
+      console.error("[Apexion Bot Error]", err?.message);
       this.initError = err.message;
     });
+    this.client.on("shardError", (error) => {
+      console.warn("[Apexion Bot Shard Error]:", error?.message);
+    });
+    this.client.on("shardDisconnect", (event, shardId) => {
+      console.warn(`[Apexion Bot Shard ${shardId} Disconnected] Code: ${event.code}`);
+      this.isReady = false;
+      this.scheduleReconnect();
+    });
+  }
+  /**
+   * Distributed leader & watchdog loop:
+   * Coordinated via Upstash Redis to ensure Preview (dev) and Published (apexion.ai.studio)
+   * never fight over the bot token or receive conflicting interactions!
+   */
+  startWatchdog() {
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    this.heartbeatTimer = setInterval(async () => {
+      try {
+        const globalTarget = await getRedisJson(GLOBAL_KEYS.BOT_MODE, "published");
+        const shouldRunHere = globalTarget === CURRENT_ENV;
+        if (shouldRunHere) {
+          if (!this.isReady && !this.isExplicitlyStopped) {
+            console.log(`[Apexion Bot Watchdog] This instance (${CURRENT_ENV}) is designated active. Connecting...`);
+            await this.start().catch(() => {
+            });
+          }
+          await setRedisJson(GLOBAL_KEYS.BOT_LEADER, { env: CURRENT_ENV, heartbeat: Date.now() }, 25);
+        } else {
+          if (this.isReady || this.client.isReady()) {
+            console.log(`[Apexion Bot Watchdog] Active mode is "${globalTarget}". Disconnecting ${CURRENT_ENV} to prevent token collision.`);
+            await this.stop().catch(() => {
+            });
+          }
+        }
+      } catch {
+      }
+    }, 1e4);
+  }
+  scheduleReconnect() {
+    if (this.isExplicitlyStopped) return;
+    if (this.reconnectTimer) return;
+    this.reconnectTimer = setTimeout(async () => {
+      this.reconnectTimer = null;
+      if (!this.isReady && !this.isExplicitlyStopped && DISCORD_BOT_TOKEN) {
+        const activeTarget = serverStorage.getBotTarget();
+        if (activeTarget === CURRENT_ENV) {
+          console.log(`[Apexion Bot (${CURRENT_ENV})] Attempting gateway reconnect...`);
+          await this.start().catch(() => {
+          });
+        }
+      }
+    }, 5e3);
   }
   async start() {
-    if (!DISCORD_BOT_TOKEN) return;
+    const activeTarget = serverStorage.getBotTarget();
+    if (activeTarget !== CURRENT_ENV) {
+      console.log(`[Apexion Bot] Standby on ${CURRENT_ENV}. Active target is "${activeTarget}". Bot will not connect here to prevent token collisions.`);
+      this.isExplicitlyStopped = true;
+      return;
+    }
+    if (!DISCORD_BOT_TOKEN) {
+      console.warn("[Apexion Bot] No token provided.");
+      return;
+    }
+    if (this.isReady || this.client.isReady()) {
+      return;
+    }
     try {
+      this.isExplicitlyStopped = false;
+      this.initError = null;
+      console.log(`[Apexion Bot (${CURRENT_ENV})] Connecting to Discord Gateway...`);
       await this.client.login(DISCORD_BOT_TOKEN);
     } catch (err) {
       this.initError = err.message;
-      console.error("[Discord Bot] Login failed:", err?.message);
+      console.error(`[Apexion Bot (${CURRENT_ENV})] Login failed:`, err?.message);
+      this.scheduleReconnect();
     }
   }
-  // Pre-fetch all application emojis at startup so lookups are 0ms in-memory
+  async stop() {
+    this.isExplicitlyStopped = true;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    if (!this.isReady && !this.client.isReady()) {
+      return;
+    }
+    try {
+      this.isReady = false;
+      this.client.destroy();
+      console.log(`[Apexion Bot (${CURRENT_ENV})] Successfully disconnected.`);
+      serverStorage.addDiscordLog({
+        user: this.botTag || "Apexion Bot",
+        command: "STANDBY",
+        serverAddress: "discord.gateway",
+        status: "warning",
+        message: `Bot on standby in ${CURRENT_ENV}`
+      });
+    } catch (err) {
+      console.warn("[Apexion Bot] Error during stop:", err?.message);
+    }
+  }
+  async setTargetMode(target) {
+    await serverStorage.setBotTarget(target);
+    if (target === CURRENT_ENV) {
+      console.log(`[Apexion Bot] Activating on ${CURRENT_ENV}...`);
+      await this.start();
+    } else {
+      console.log(`[Apexion Bot] Standing down on ${CURRENT_ENV} (target is now ${target})...`);
+      await this.stop();
+    }
+  }
   async loadExistingApplicationEmojis() {
     try {
       const app = this.client.application;
@@ -1958,38 +2363,51 @@ var DiscordBotService = class {
       if (emojis) {
         emojis.forEach((e) => {
           if (e.name) {
-            const cleanKey = e.name.toLowerCase().replace(/^head_/, "");
-            this.playerEmojiCache.set(cleanKey, `<:${e.name}:${e.id}>`);
+            const cleanKey = e.name.toLowerCase().replace(/^(?:bhead_|head_)/, "");
+            if (!this.playerEmojiCache.has(cleanKey) || e.name.startsWith("bhead_")) {
+              this.playerEmojiCache.set(cleanKey, `<:${e.name}:${e.id}>`);
+            }
           }
         });
-        console.log(`[Discord Bot] Loaded ${emojis.size} pre-existing application head emojis into memory cache.`);
       }
-    } catch (err) {
-      console.warn("[Discord Bot] Could not preload application emojis:", err?.message);
+    } catch {
     }
   }
-  // Register Clean Slash Commands WITHOUT optional server address parameter
   async registerSlashCommands() {
     const commands = [
-      new SlashCommandBuilder().setName("configure").setDescription("Link your Aternos server with your session").addStringOption((o) => o.setName("session").setDescription("Aternos session cookie").setRequired(true)),
+      new SlashCommandBuilder().setName("configure").setDescription("Link your Aternos server with your session cookie").addStringOption((o) => o.setName("session").setDescription("Aternos session cookie").setRequired(true)),
       new SlashCommandBuilder().setName("start").setDescription("Turn on your Minecraft server (only when offline)"),
       new SlashCommandBuilder().setName("stop").setDescription("Turn off your Minecraft server (only when online)"),
       new SlashCommandBuilder().setName("restart").setDescription("Reboot your Minecraft server"),
-      new SlashCommandBuilder().setName("status").setDescription("Check server status, online players, and port details"),
-      new SlashCommandBuilder().setName("players").setDescription("View connected players and their small avatars")
+      new SlashCommandBuilder().setName("status").setDescription("Check server online/offline status, players, and details"),
+      new SlashCommandBuilder().setName("players").setDescription("View connected players and active player count")
     ];
     try {
       const rest = new REST({ version: "10" }).setToken(DISCORD_BOT_TOKEN);
-      await rest.put(Routes.applicationCommands(this.botId || DISCORD_CLIENT_ID), {
+      const targetId = this.botId || DISCORD_CLIENT_ID;
+      await rest.put(Routes.applicationCommands(targetId), {
         body: commands.map((cmd) => cmd.toJSON())
       });
-      console.log("[Discord Bot] Clean slash commands registered successfully.");
+      console.log("[Apexion Bot] Global slash commands registered.");
+      for (const [guildId] of this.client.guilds.cache) {
+        rest.put(Routes.applicationGuildCommands(targetId, guildId), {
+          body: []
+        }).catch(() => {
+        });
+      }
     } catch (err) {
-      console.warn("[Discord Bot] Slash commands notice:", err?.message);
+      console.warn("[Apexion Bot] Slash commands registration notice:", err?.message);
     }
   }
-  resolveServerContext(contextId, userId) {
+  /**
+   * Resolves server context accurately for multi-user / multi-guild setups.
+   * Ensures bindings configured in a server channel, guild, or DM are correctly found.
+   */
+  resolveServerContext(contextId, userId, guildId) {
     let binding = serverStorage.getDiscordBinding(contextId);
+    if (!binding && guildId) {
+      binding = serverStorage.getDiscordBinding(guildId);
+    }
     if (!binding && userId) {
       binding = serverStorage.getDiscordBinding(userId);
     }
@@ -2002,22 +2420,8 @@ var DiscordBotService = class {
         binding
       };
     }
-    const allStates = aternosService.getAllStates();
-    const allProfiles = serverStorage.getAllProfiles();
-    for (const p of allProfiles) {
-      const pCanon = serverStorage.getCanonicalServerAddress(p.serverIp || p.name);
-      const st = allStates[pCanon.toLowerCase()] || allStates[p.id];
-      if (st && (st.status === "online" || st.status === "starting")) {
-        return {
-          serverAddress: pCanon,
-          sessionCookie: p.sessionCookie,
-          serverCookie: p.serverCookie,
-          profile: p
-        };
-      }
-    }
     const cfg = aternosService.getConfig();
-    if (cfg.serverAddress) {
+    if (cfg.serverAddress && cfg.sessionCookie) {
       const canonical = serverStorage.getCanonicalServerAddress(cfg.serverAddress);
       const profile = serverStorage.getProfile(canonical) || serverStorage.getProfile(cfg.serverAddress);
       return {
@@ -2027,6 +2431,7 @@ var DiscordBotService = class {
         profile
       };
     }
+    const allProfiles = serverStorage.getAllProfiles();
     if (allProfiles.length > 0) {
       const p = allProfiles[0];
       const canonical = serverStorage.getCanonicalServerAddress(p.serverIp || p.name);
@@ -2037,169 +2442,209 @@ var DiscordBotService = class {
         profile: p
       };
     }
-    const defaultCanonical = "Bang_Bros_SMP.aternos.me";
     return {
-      serverAddress: defaultCanonical,
+      serverAddress: "",
       sessionCookie: "",
       serverCookie: ""
     };
   }
-  // Instant 0ms synchronous head emoji lookup.
-  // Never blocks, never stalls commands, never causes Discord rate limit issues.
-  // If emoji exists in memory, returns <:head_name:id>.
-  // If not, returns 👤 immediately and queues background creation.
+  async ensurePlayerHeadEmoji(playerName, guild) {
+    const cleanName = playerName.trim();
+    if (!cleanName) return "\u{1F464}";
+    const cacheKey = cleanName.toLowerCase().replace(/[^a-z0-9_]/g, "_").slice(0, 26);
+    if (this.playerEmojiCache.has(cacheKey)) {
+      return this.playerEmojiCache.get(cacheKey);
+    }
+    const emojiName = `head_${cacheKey}`;
+    const legacyName = `bhead_${cacheKey}`;
+    const app = this.client.application;
+    try {
+      if (app?.emojis?.cache) {
+        const found = app.emojis.cache.find((e) => e.name === emojiName || e.name === legacyName);
+        if (found) {
+          const formatted = `<:${found.name}:${found.id}>`;
+          this.playerEmojiCache.set(cacheKey, formatted);
+          return formatted;
+        }
+      }
+    } catch {
+    }
+    try {
+      if (guild?.emojis?.cache) {
+        const found = guild.emojis.cache.find((e) => e.name === emojiName || e.name === legacyName);
+        if (found) {
+          const formatted = `<:${found.name}:${found.id}>`;
+          this.playerEmojiCache.set(cacheKey, formatted);
+          return formatted;
+        }
+      }
+    } catch {
+    }
+    try {
+      const avatarUrl = `https://mc-heads.net/avatar/${encodeURIComponent(cleanName)}/32`;
+      const ac = new AbortController();
+      const tm = setTimeout(() => ac.abort(), 2e3);
+      const res = await fetch(avatarUrl, { signal: ac.signal });
+      clearTimeout(tm);
+      if (res.ok) {
+        const arrayBuf = await res.arrayBuffer();
+        const buffer = Buffer.from(arrayBuf);
+        if (app?.emojis?.create) {
+          try {
+            const newEmoji = await app.emojis.create({
+              attachment: buffer,
+              name: emojiName
+            });
+            if (newEmoji?.id) {
+              const formatted = `<:${newEmoji.name}:${newEmoji.id}>`;
+              this.playerEmojiCache.set(cacheKey, formatted);
+              return formatted;
+            }
+          } catch (appErr) {
+            console.warn("[Apexion Bot] App emoji upload notice:", appErr?.message);
+          }
+        }
+        if (guild?.emojis?.create) {
+          try {
+            const newEmoji = await guild.emojis.create({
+              attachment: buffer,
+              name: emojiName
+            });
+            if (newEmoji?.id) {
+              const formatted = `<:${newEmoji.name}:${newEmoji.id}>`;
+              this.playerEmojiCache.set(cacheKey, formatted);
+              return formatted;
+            }
+          } catch (guildErr) {
+            console.warn("[Apexion Bot] Guild emoji upload notice:", guildErr?.message);
+          }
+        }
+      }
+    } catch (err) {
+      console.warn(`[Apexion Bot] Could not fetch avatar for ${cleanName}:`, err?.message);
+    }
+    return "\u{1F464}";
+  }
   getPlayerHeadEmoji(playerName) {
     const cleanName = playerName.trim();
     if (!cleanName) return "\u{1F464}";
     const cacheKey = cleanName.toLowerCase().replace(/[^a-z0-9_]/g, "_").slice(0, 26);
-    const cached = this.playerEmojiCache.get(cacheKey);
-    if (cached) return cached;
-    const app = this.client.application;
-    const emojiName = `head_${cacheKey}`;
-    const found = app?.emojis?.cache?.find((e) => e.name === emojiName);
-    if (found) {
-      const formatted = `<:${found.name}:${found.id}>`;
-      this.playerEmojiCache.set(cacheKey, formatted);
-      return formatted;
+    return this.playerEmojiCache.get(cacheKey) || "\u{1F464}";
+  }
+  // Fast resolution of fresh Aternos + Minecraft live status
+  async getFastServerState(serverAddress, sessionCookie) {
+    let state = aternosService.getState(serverAddress);
+    if (!sessionCookie) {
+      const p = serverStorage.getProfile(serverAddress) || serverStorage.getProfile(serverStorage.getCanonicalServerAddress(serverAddress));
+      if (p?.sessionCookie) {
+        sessionCookie = p.sessionCookie;
+      }
     }
-    this.queueBackgroundEmojiCreation(cleanName);
-    return "\u{1F464}";
-  }
-  // Queue background head creation so it NEVER slows down user interactions
-  queueBackgroundEmojiCreation(playerName) {
-    if (!this.canCreateApplicationEmojis) return;
-    const cleanKey = playerName.trim().toLowerCase().replace(/[^a-z0-9_]/g, "_").slice(0, 26);
-    if (this.playerEmojiCache.has(cleanKey)) return;
-    if (this.emojiQueue.includes(playerName)) return;
-    this.emojiQueue.push(playerName);
-    this.processEmojiQueue();
-  }
-  async processEmojiQueue() {
-    if (this.isProcessingEmojiQueue || this.emojiQueue.length === 0) return;
-    this.isProcessingEmojiQueue = true;
-    try {
-      while (this.emojiQueue.length > 0) {
-        const nextName = this.emojiQueue.shift();
-        if (!nextName) continue;
-        const cleanKey = nextName.trim().toLowerCase().replace(/[^a-z0-9_]/g, "_").slice(0, 26);
-        if (this.playerEmojiCache.has(cleanKey)) continue;
-        await this.createHeadEmojiInBackground(nextName, cleanKey);
-        await new Promise((r) => setTimeout(r, 1500));
-      }
-    } finally {
-      this.isProcessingEmojiQueue = false;
-    }
-  }
-  async createHeadEmojiInBackground(cleanName, cacheKey) {
-    try {
-      const app = this.client.application;
-      if (!app?.emojis) return;
-      const emojiName = `head_${cacheKey}`;
-      let appEmojis = app.emojis.cache;
-      if (!appEmojis || appEmojis.size === 0) {
-        appEmojis = await app.emojis.fetch().catch(() => null);
-      }
-      const existing = appEmojis?.find((e) => e.name === emojiName);
-      if (existing) {
-        this.playerEmojiCache.set(cacheKey, `<:${existing.name}:${existing.id}>`);
-        return;
-      }
-      if (appEmojis && appEmojis.size >= 48) {
-        const oldest = appEmojis.find((e) => e.name?.startsWith("head_"));
-        if (oldest) {
-          await oldest.delete().catch(() => {
-          });
+    const isCold = !state.lastUpdated || state.lastUpdated === 0;
+    const isStale = Date.now() - (state.lastUpdated || 0) > 4e3;
+    if (sessionCookie && (isCold || isStale || state.status === "offline")) {
+      try {
+        const syncTimeout = new Promise((resolve) => setTimeout(() => resolve(state), 7e3));
+        const synced = await Promise.race([aternosService.syncSessionState(serverAddress), syncTimeout]);
+        if (synced && synced.lastUpdated) {
+          state = synced;
         }
-      }
-      const candidateUrls = [
-        `https://mc-heads.net/avatar/${encodeURIComponent(cleanName)}/64`,
-        `https://crafthead.net/helm/${encodeURIComponent(cleanName)}/64`,
-        `https://minotar.net/helm/${encodeURIComponent(cleanName)}/64.png`
-      ];
-      let imageBuf = null;
-      for (const url of candidateUrls) {
-        try {
-          const controller = new AbortController();
-          const tm = setTimeout(() => controller.abort(), 1800);
-          const res = await fetch(url, { signal: controller.signal });
-          clearTimeout(tm);
-          if (res.ok) {
-            const arrayBuf = await res.arrayBuffer();
-            if (arrayBuf.byteLength > 200) {
-              imageBuf = Buffer.from(arrayBuf);
-              break;
-            }
-          }
-        } catch {
-        }
-      }
-      if (!imageBuf) return;
-      const size = 64;
-      const radius = 16;
-      const roundedCornersSvg = Buffer.from(
-        `<svg><rect x="0" y="0" width="${size}" height="${size}" rx="${radius}" ry="${radius}"/></svg>`
-      );
-      const roundedBuf = await sharp(imageBuf).resize(size, size).composite([{ input: roundedCornersSvg, blend: "dest-in" }]).png().toBuffer();
-      const created = await app.emojis.create({
-        attachment: roundedBuf,
-        name: emojiName
-      });
-      if (created) {
-        this.playerEmojiCache.set(cacheKey, `<:${created.name}:${created.id}>`);
-      }
-    } catch (err) {
-      if (err?.code === 30008 || err?.status === 403) {
-        this.canCreateApplicationEmojis = false;
+      } catch {
       }
     }
+    const targetWithPort = state.serverPort && !serverAddress.includes(":") ? `${serverAddress}:${state.serverPort}` : serverAddress;
+    const live = await queryMinecraftServer(
+      targetWithPort,
+      state.dynip,
+      state.playersOnline || 0,
+      state.playerList || [],
+      state.status === "online" || state.status === "starting"
+    );
+    if (state.status === "offline" || state.status === "stopping") {
+      state.countdownActive = false;
+      state.countdownSeconds = null;
+      state.countdownFormatted = null;
+      state.canExtend = false;
+      state.playersOnline = 0;
+      state.playerList = [];
+    }
+    return { state, live };
   }
-  // Build real-time server status diagnostics embed
-  // Shows small player heads for players, NO big player head thumbnail!
-  buildStatusEmbed(serverAddress, state, live) {
+  // Build clean, polished real-time server status diagnostics embed
+  async buildStatusEmbed(serverAddress, state, live, guild) {
     const canonicalAddr = serverStorage.getCanonicalServerAddress(serverAddress);
-    const isOnline = state.status === "online" || live?.online;
-    const statusText = isOnline ? "\u{1F7E2} Online" : state.status === "starting" ? "\u{1F7E1} Starting" : state.status === "queue" ? "\u23F3 In Queue" : "\u{1F534} Offline";
-    const color = isOnline ? 1096065 : state.status === "starting" ? 16096779 : 15680580;
-    const playerCount = Math.max(live?.players?.online || 0, state.playersOnline || 0);
+    const isStopping = state.status === "stopping";
+    const isStarting = state.status === "starting";
+    const isQueue = state.status === "queue";
+    const isAternosOnline = state.status === "online";
+    const isLiveOnline = Boolean(live?.online) && !isAternosOfflineIndicator(live?.version, live?.motd);
+    let isOnline = false;
+    let statusText = "\u{1F534} Offline";
+    let color = 15680580;
+    if (isStopping) {
+      statusText = "\u{1F7E0} Stopping";
+      color = 16347926;
+    } else if (isStarting) {
+      statusText = `\u{1F7E1} ${state.rawStatus || "Starting ..."}`;
+      color = 16096779;
+    } else if (isQueue) {
+      statusText = "\u23F3 In Queue";
+      color = 16096779;
+    } else if (isAternosOnline || isLiveOnline) {
+      isOnline = true;
+      statusText = "\u{1F7E2} Online";
+      color = 1096065;
+    } else {
+      isOnline = false;
+      statusText = "\u{1F534} Offline";
+      color = 15680580;
+    }
+    const playerCount = isOnline ? Math.max(live?.players?.online || 0, state.playersOnline || 0) : 0;
     const maxCount = live?.players?.max || state.maxPlayers || 20;
-    const embed = new EmbedBuilder().setColor(color).setTitle(`\u{1F3AE} Minecraft Server Diagnostics`).setDescription(`Live status for **${canonicalAddr}**:`).addFields(
+    const playerNames = [];
+    if (isOnline) {
+      if (Array.isArray(live?.players?.list)) {
+        for (const p of live.players.list) {
+          if (p?.name && !playerNames.includes(p.name)) playerNames.push(p.name);
+        }
+      }
+      if (Array.isArray(state.playerList)) {
+        for (const name of state.playerList) {
+          if (name && !playerNames.includes(name)) playerNames.push(name);
+        }
+      }
+    }
+    const embed = new EmbedBuilder().setColor(color).setTitle(`\u{1F3AE} ${canonicalAddr}`).setDescription(
+      isOnline ? `\u{1F7E2} Server is **Online** and joinable.` : isStarting ? `\u{1F7E1} Server is **Starting** \u2014 please allow 1-2 minutes for world load.` : isStopping ? `\u{1F7E0} Server is **Stopping** \u2014 saving world data.` : `\u{1F534} Server is **Offline**.`
+    ).addFields(
       { name: "Status", value: `**${statusText}**`, inline: true },
-      { name: "Players Online", value: `\`${playerCount}/${maxCount}\` active`, inline: true },
+      { name: "Players", value: `\`${playerCount}/${maxCount}\` online`, inline: true },
       { name: "Server Address", value: `\`${canonicalAddr}:${state.serverPort || 25565}\``, inline: true }
     );
-    if (state.dynip) {
+    if (isOnline && state.dynip) {
       embed.addFields({ name: "Direct Connect IP", value: `\`${state.dynip}\``, inline: true });
     }
-    if (state.software || live?.version) {
+    if (state.software || live?.version || state.version) {
       embed.addFields({
         name: "Version & Software",
         value: `${state.software || "Fabric"} ${live?.version || state.version || "1.20.4"}`,
         inline: true
       });
     }
-    const playerNames = [];
-    if (Array.isArray(live?.players?.list)) {
-      for (const p of live.players.list) {
-        if (p?.name && !playerNames.includes(p.name)) playerNames.push(p.name);
-      }
-    }
-    if (Array.isArray(state.playerList)) {
-      for (const name of state.playerList) {
-        if (name && !playerNames.includes(name)) playerNames.push(name);
-      }
-    }
-    if (playerNames.length > 0) {
-      const playerListItems = playerNames.map((n) => {
-        const head = this.getPlayerHeadEmoji(n);
-        return `${head} **${n}**`;
-      });
+    if (isOnline && playerNames.length > 0) {
+      const playerListItems = await Promise.all(
+        playerNames.map(async (n) => {
+          const head = await this.ensurePlayerHeadEmoji(n, guild);
+          return `${head} **${n}**`;
+        })
+      );
       embed.addFields({
         name: `\u{1F464} Connected Players (${playerNames.length})`,
         value: playerListItems.join("  \u2022  "),
         inline: false
       });
     }
-    if (state.motd || live?.motd) {
+    if (isOnline && (state.motd || live?.motd)) {
       embed.addFields({
         name: "\u{1F4DC} MOTD",
         value: `*${state.motd || live?.motd}*`,
@@ -2207,94 +2652,61 @@ var DiscordBotService = class {
       });
     }
     if (isOnline) {
-      if (playerCount === 0) {
-        const secs = state.countdownSeconds ?? 360;
+      if (playerCount > 0) {
+        embed.addFields({
+          name: "\u23F1\uFE0F Keepalive Timer",
+          value: `\u{1F7E2} **Paused** (${playerCount} active player${playerCount > 1 ? "s" : ""} connected)`,
+          inline: false
+        });
+      } else if (state.countdownActive && typeof state.countdownSeconds === "number" && state.countdownSeconds > 0) {
+        const secs = state.countdownSeconds;
         const mins = Math.floor(secs / 60);
         const s = secs % 60;
         const formatted = state.countdownFormatted || `${mins}:${s < 10 ? "0" : ""}${s}`;
         const targetEpoch = Math.floor(Date.now() / 1e3) + secs;
         embed.addFields({
           name: "\u23F1\uFE0F Keepalive Timer",
-          value: `\`${formatted}\` remaining \u2022 Auto-shutdown <t:${targetEpoch}:R>
-*(Synced with Aternos dashboard)*`,
-          inline: false
-        });
-      } else {
-        embed.addFields({
-          name: "\u23F1\uFE0F Keepalive Timer",
-          value: `\u{1F7E2} **Paused** (${playerCount} active player${playerCount > 1 ? "s" : ""} connected)`,
+          value: `\`${formatted}\` remaining \u2022 Auto-shutdown <t:${targetEpoch}:R>`,
           inline: false
         });
       }
+    } else if (!isStarting && !isStopping) {
+      embed.addFields({
+        name: "\u{1F4A1} Action",
+        value: "Server is currently offline. Use `/start` to turn it on!",
+        inline: false
+      });
     }
-    embed.setFooter({ text: "Aternos Command Center", iconURL: this.client.user?.displayAvatarURL() });
+    embed.setFooter({ text: "Apexion" });
     embed.setTimestamp();
     return embed;
   }
-  // Fast resolution of fresh Aternos + Minecraft live status with concurrency protection
-  async getFastServerState(serverAddress, sessionCookie) {
-    let state = aternosService.getState(serverAddress);
-    if (sessionCookie && (state.status === "offline" || Date.now() - state.lastUpdated > 3500)) {
-      try {
-        const syncTimeout = new Promise((resolve) => setTimeout(() => resolve(state), 2500));
-        state = await Promise.race([aternosService.syncSessionState(serverAddress), syncTimeout]);
-      } catch {
-      }
-    }
-    const live = await queryMinecraftServer(
-      serverAddress,
-      state.dynip,
-      state.playersOnline || 0,
-      state.playerList || [],
-      state.status === "online" || state.status === "starting"
-    );
-    return { state, live };
-  }
-  // Clean up previous bot messages for the user so each new command replaces the old message
-  async deleteUserPreviousMessages(userId, currentInteraction) {
-    const prevList = this.userLastInteractions.get(userId) || [];
-    for (const item of prevList) {
-      if (item.interaction && item.interaction.id !== currentInteraction.id) {
-        try {
-          if (Date.now() - item.timestamp < 14 * 60 * 1e3) {
-            await item.interaction.deleteReply().catch(() => {
-            });
-          }
-        } catch {
-        }
-      }
-    }
-    this.userLastInteractions.set(userId, [
-      { interaction: currentInteraction, timestamp: Date.now() }
-    ]);
-    try {
-      const channel = currentInteraction.channel;
-      if (channel && "messages" in channel && typeof channel.messages?.fetch === "function") {
-        const fetched = await channel.messages.fetch({ limit: 10 }).catch(() => null);
-        if (fetched) {
-          const botMessages = fetched.filter((m) => m.author?.id === this.client.user?.id);
-          for (const [, msg] of botMessages) {
-            await msg.delete().catch(() => {
-            });
-          }
-        }
-      }
-    } catch {
-    }
-  }
-  // Handle Slash Command with complete concurrency and rate limit protection
+  // Handle Slash Command
   async handleSlashCommand(interaction) {
     const { commandName, user, guildId, channelId } = interaction;
-    const contextId = guildId || channelId || user.id;
+    const contextId = channelId || guildId || user.id;
     try {
       if (!interaction.deferred && !interaction.replied) {
         await interaction.deferReply({ ephemeral: true });
       }
     } catch (err) {
-      console.warn(`[Discord] Could not defer /${commandName}:`, err?.message);
+      console.warn(`[Apexion] Could not defer /${commandName}:`, err?.message);
       return;
     }
-    await this.deleteUserPreviousMessages(user.id, interaction);
+    const prevInteraction = this.lastUserReplies.get(user.id);
+    this.lastUserReplies.set(user.id, interaction);
+    if (prevInteraction && prevInteraction.id !== interaction.id) {
+      prevInteraction.deleteReply().catch(() => {
+      });
+    }
+    if (channelId && this.lastChannelMessageIds.has(channelId)) {
+      const prevMsgId = this.lastChannelMessageIds.get(channelId);
+      this.lastChannelMessageIds.delete(channelId);
+      if (prevMsgId && interaction.channel && "messages" in interaction.channel) {
+        interaction.channel.messages.delete(prevMsgId).catch(() => {
+        });
+      }
+    }
     try {
       switch (commandName) {
         case "configure": {
@@ -2312,6 +2724,16 @@ var DiscordBotService = class {
               configuredBy: user.username,
               updatedAt: Date.now()
             });
+            if (guildId && guildId !== contextId) {
+              serverStorage.setDiscordBinding({
+                guildIdOrUserId: guildId,
+                serverAddress: canonicalAddr,
+                sessionCookie: session,
+                serverCookie: matchedServer.serverCookie,
+                configuredBy: user.username,
+                updatedAt: Date.now()
+              });
+            }
             if (user.id !== contextId) {
               serverStorage.setDiscordBinding({
                 guildIdOrUserId: user.id,
@@ -2334,7 +2756,7 @@ var DiscordBotService = class {
               status: "success",
               message: `Linked ${canonicalAddr}`
             });
-            const embed2 = new EmbedBuilder().setColor(1096065).setTitle("\u2699\uFE0F Aternos Server Configured").setDescription(`Successfully linked **${canonicalAddr}** to this Discord server.
+            const embed2 = new EmbedBuilder().setColor(1096065).setTitle("\u2699\uFE0F Aternos Server Configured").setDescription(`Successfully linked **${canonicalAddr}** to Apexion.
 You can now control your server using slash commands.`).addFields(
               { name: "\u{1F310} Server Address", value: `\`${canonicalAddr}\``, inline: true },
               { name: "\u{1F511} Server ID", value: `\`${matchedServer.id}\``, inline: true },
@@ -2343,14 +2765,14 @@ You can now control your server using slash commands.`).addFields(
                 name: "\u{1F3AE} Control Commands",
                 value: "`/status` \u2014 Check online status & player count\n`/players` \u2014 View online players\n`/start` \u2014 Turn on server\n`/stop` \u2014 Turn off server\n`/restart` \u2014 Reboot server"
               }
-            ).setFooter({ text: "Aternos Command Center", iconURL: this.client.user?.displayAvatarURL() }).setTimestamp();
+            ).setFooter({ text: "Apexion" }).setTimestamp();
             await interaction.editReply({ embeds: [embed2] });
             return;
           }
           if (discovered.length === 0) {
             const embed2 = new EmbedBuilder().setColor(15680580).setTitle("\u274C No Aternos Servers Found").setDescription(
               "Could not locate any servers on this Aternos account.\nPlease make sure your `ATERNOS_SESSION` cookie is copied from your browser while logged into [aternos.org](https://aternos.org/servers/)."
-            );
+            ).setFooter({ text: "Apexion" });
             await interaction.editReply({ embeds: [embed2] });
             return;
           }
@@ -2359,6 +2781,7 @@ You can now control your server using slash commands.`).addFields(
             session,
             servers: discovered,
             contextId,
+            guildId: guildId || void 0,
             userId: user.id,
             userName: user.username
           });
@@ -2379,21 +2802,22 @@ You can now control your server using slash commands.`).addFields(
           break;
         }
         case "start": {
-          const ctx = this.resolveServerContext(contextId, user.id);
+          const ctx = this.resolveServerContext(contextId, user.id, guildId);
           const { state, live } = await this.getFastServerState(ctx.serverAddress, ctx.sessionCookie);
-          if (state.status === "online" || live.online) {
-            const embed = new EmbedBuilder().setColor(15680580).setTitle("\u26A0\uFE0F Server is Already Online!").setDescription(`**${ctx.serverAddress}** is already online and running. You cannot start a server that is currently active.`).addFields(
+          const isOnline = !isAternosOfflineIndicator(live?.version, live?.motd) && Boolean(live?.online) && state.status !== "offline";
+          if (isOnline) {
+            const embed = new EmbedBuilder().setColor(15680580).setTitle(`\u26A0\uFE0F ${ctx.serverAddress} is Already Online!`).setDescription(`Server is already online and joinable.`).addFields(
               { name: "Status", value: "\u{1F7E2} **Online**", inline: true },
-              { name: "Players", value: `\`${live.players.online}/${live.players.max}\``, inline: true },
-              { name: "Tip", value: "Use `/stop` to shut it down, or `/restart` to reboot.", inline: false }
-            );
+              { name: "Players", value: `\`${live.players?.online || 0}/${live.players?.max || 20}\``, inline: true },
+              { name: "Tip", value: "Use `/stop` to shut down, or `/restart` to reboot.", inline: false }
+            ).setFooter({ text: "Apexion" }).setTimestamp();
             await interaction.editReply({ embeds: [embed] });
-            return;
+            break;
           }
           if (state.status === "starting" || state.status === "queue") {
-            const embed = new EmbedBuilder().setColor(16096779).setTitle("\u23F3 Server is Currently Booting Up!").setDescription(`**${ctx.serverAddress}** is already in the starting sequence. Please give it 1 to 2 minutes to load world data.`).addFields({ name: "Current Status", value: `\u{1F7E1} ${state.rawStatus || "Starting ..."}` });
+            const embed = new EmbedBuilder().setColor(16096779).setTitle(`\u23F3 ${ctx.serverAddress} is Booting Up!`).setDescription(`Server is already in the starting sequence. Please give it 1 to 2 minutes.`).addFields({ name: "Current Status", value: `\u{1F7E1} ${state.rawStatus || "Starting ..."}` }).setFooter({ text: "Apexion" }).setTimestamp();
             await interaction.editReply({ embeds: [embed] });
-            return;
+            break;
           }
           const res = await aternosService.startServer(ctx.serverAddress, {
             sessionCookie: ctx.sessionCookie,
@@ -2408,33 +2832,34 @@ You can now control your server using slash commands.`).addFields(
             message: res.message
           });
           if (res.success) {
-            const embed = new EmbedBuilder().setColor(1096065).setTitle("\u{1F680} Server Boot Sequence Initiated").setDescription(`Start signal dispatched to Aternos for **${ctx.serverAddress}**.
-The server is now starting up and will be ready for players in ~1-2 minutes.`).addFields(
+            const embed = new EmbedBuilder().setColor(1096065).setTitle(`\u{1F680} Starting ${ctx.serverAddress}`).setDescription(`Start signal sent to Aternos. The server is booting up and will be ready for players in ~1-2 minutes.`).addFields(
               { name: "Status", value: "\u{1F7E1} **Starting ...**", inline: true },
               { name: "Estimated Time", value: "~60-90 seconds", inline: true },
               { name: "Tip", value: "Run `/status` in a moment to track startup progress.", inline: false }
-            ).setTimestamp();
+            ).setFooter({ text: "Apexion" }).setTimestamp();
             await interaction.editReply({ embeds: [embed] });
           } else {
             const embed = new EmbedBuilder().setColor(15680580).setTitle("\u274C Start Command Failed").setDescription(`Aternos rejected the start request:
 \`${res.message}\`
-Verify that your session cookie is valid via \`/configure\`.`);
+Verify that your session cookie is valid via \`/configure\`.`).setFooter({ text: "Apexion" }).setTimestamp();
             await interaction.editReply({ embeds: [embed] });
           }
           break;
         }
         case "stop": {
-          const ctx = this.resolveServerContext(contextId, user.id);
+          const ctx = this.resolveServerContext(contextId, user.id, guildId);
           const { state, live } = await this.getFastServerState(ctx.serverAddress, ctx.sessionCookie);
-          if (state.status === "offline" && !live.online) {
-            const embed = new EmbedBuilder().setColor(15680580).setTitle("\u26A0\uFE0F Server is Already Offline!").setDescription(`**${ctx.serverAddress}** is already turned off. Cannot stop a server that isn't running.`).addFields({ name: "Tip", value: "Use `/start` if you would like to boot it up." });
+          const isOnline = !isAternosOfflineIndicator(live?.version, live?.motd) && (live?.online || state.status === "online");
+          if (!isOnline && state.status !== "starting" && state.status !== "stopping") {
+            const embed = new EmbedBuilder().setColor(15680580).setTitle(`\u26A0\uFE0F ${ctx.serverAddress} is Already Offline!`).setDescription(`Cannot stop a server that isn't running.
+Use \`/start\` if you would like to boot it up.`).setFooter({ text: "Apexion" }).setTimestamp();
             await interaction.editReply({ embeds: [embed] });
-            return;
+            break;
           }
           if (state.status === "stopping") {
-            const embed = new EmbedBuilder().setColor(16096779).setTitle("\u23F3 Server is Already Shutting Down!").setDescription(`**${ctx.serverAddress}** is already in the shutdown sequence. Please wait while world files are saved.`);
+            const embed = new EmbedBuilder().setColor(16096779).setTitle(`\u23F3 ${ctx.serverAddress} is Shutting Down!`).setDescription(`Server is already shutting down and saving world files.`).setFooter({ text: "Apexion" }).setTimestamp();
             await interaction.editReply({ embeds: [embed] });
-            return;
+            break;
           }
           const res = await aternosService.stopServer(ctx.serverAddress, {
             sessionCookie: ctx.sessionCookie,
@@ -2449,89 +2874,91 @@ Verify that your session cookie is valid via \`/configure\`.`);
             message: res.message
           });
           if (res.success) {
-            const embed = new EmbedBuilder().setColor(16347926).setTitle("\u{1F6D1} Server Shutdown Initiated").setDescription(`Stop signal successfully sent to Aternos for **${ctx.serverAddress}**.
-World progress is being saved and the server is powering down safely.`).addFields({ name: "Status", value: "\u{1F7E0} **Stopping ...**", inline: true }).setTimestamp();
+            const embed = new EmbedBuilder().setColor(16347926).setTitle(`\u{1F6D1} Stopping ${ctx.serverAddress}`).setDescription(`Stop signal sent to Aternos. World progress is being saved and the server is powering down safely.`).addFields({ name: "Status", value: "\u{1F7E0} **Stopping ...**", inline: true }).setFooter({ text: "Apexion" }).setTimestamp();
             await interaction.editReply({ embeds: [embed] });
           } else {
-            const embed = new EmbedBuilder().setColor(15680580).setTitle("\u274C Stop Command Failed").setDescription(`Aternos returned: \`${res.message}\``);
+            const embed = new EmbedBuilder().setColor(15680580).setTitle("\u274C Stop Command Failed").setDescription(`Aternos returned: \`${res.message}\``).setFooter({ text: "Apexion" }).setTimestamp();
             await interaction.editReply({ embeds: [embed] });
           }
           break;
         }
         case "restart": {
-          const ctx = this.resolveServerContext(contextId, user.id);
+          const ctx = this.resolveServerContext(contextId, user.id, guildId);
           const res = await aternosService.restartServer(ctx.serverAddress, {
             sessionCookie: ctx.sessionCookie,
             serverCookie: ctx.serverCookie,
             serverAddress: ctx.serverAddress
           });
-          const embed = new EmbedBuilder().setColor(res.success ? 3900150 : 15680580).setTitle(res.success ? "\u{1F504} Server Reboot Triggered" : "\u274C Restart Failed").setDescription(`Restart signal sent to Aternos for **${ctx.serverAddress}**.
-The server will cycle off and boot back up automatically.`).addFields({ name: "Result", value: res.message });
+          const embed = new EmbedBuilder().setColor(res.success ? 3900150 : 15680580).setTitle(res.success ? `\u{1F504} Rebooting ${ctx.serverAddress}` : "\u274C Restart Failed").setDescription(`Restart signal sent to Aternos. The server will cycle off and boot back up automatically.`).addFields({ name: "Result", value: res.message }).setFooter({ text: "Apexion" }).setTimestamp();
           await interaction.editReply({ embeds: [embed] });
           break;
         }
         case "status": {
-          const ctx = this.resolveServerContext(contextId, user.id);
+          const ctx = this.resolveServerContext(contextId, user.id, guildId);
           const { state, live } = await this.getFastServerState(ctx.serverAddress, ctx.sessionCookie);
-          const embed = this.buildStatusEmbed(ctx.serverAddress, state, live);
+          const embed = await this.buildStatusEmbed(ctx.serverAddress, state, live, interaction.guild);
           await interaction.editReply({ embeds: [embed] });
           break;
         }
         case "players": {
-          const ctx = this.resolveServerContext(contextId, user.id);
+          const ctx = this.resolveServerContext(contextId, user.id, guildId);
           const { state, live } = await this.getFastServerState(ctx.serverAddress, ctx.sessionCookie);
-          const isOnline = live.online || state.status === "online" || state.status === "starting";
-          if (!isOnline) {
-            const embed2 = new EmbedBuilder().setColor(15680580).setTitle("\u{1F534} Server is Offline").setDescription(`Cannot fetch active players because **${ctx.serverAddress}** is currently offline.
-Use \`/start\` to bring the server online.`);
+          const isStopping = state.status === "stopping";
+          const isStarting = state.status === "starting";
+          const isAternosOnline = state.status === "online";
+          const isLiveOnline = Boolean(live?.online) && !isAternosOfflineIndicator(live?.version, live?.motd);
+          const isOnline = !isStopping && !isStarting && (isAternosOnline || isLiveOnline);
+          if (isStarting) {
+            const embed2 = new EmbedBuilder().setColor(16096779).setTitle(`\u23F3 Server is Starting`).setDescription(`**${ctx.serverAddress}** is currently booting up. Players can join once world loading finishes.`).setFooter({ text: "Apexion" }).setTimestamp();
             await interaction.editReply({ embeds: [embed2] });
-            return;
+            break;
+          }
+          if (!isOnline) {
+            const embed2 = new EmbedBuilder().setColor(15680580).setTitle(`\u{1F534} Server is Offline`).setDescription(`**${ctx.serverAddress}** is currently offline. Active players cannot be queried.
+Use \`/start\` to bring the server online!`).setFooter({ text: "Apexion" }).setTimestamp();
+            await interaction.editReply({ embeds: [embed2] });
+            break;
           }
           const playerNames = /* @__PURE__ */ new Set();
-          for (const p of live.players?.list || []) {
-            if (p?.name) playerNames.add(p.name);
+          if (Array.isArray(live?.players?.list)) {
+            for (const p of live.players.list) {
+              if (p?.name) playerNames.add(p.name);
+            }
           }
-          for (const name of state.playerList || []) {
-            if (name) playerNames.add(name);
+          if (Array.isArray(state?.playerList)) {
+            for (const name of state.playerList) {
+              if (name) playerNames.add(name);
+            }
           }
           const combinedList = Array.from(playerNames);
-          const count = Math.max(combinedList.length, live.players?.online || 0, state.playersOnline || 0);
-          const max = live.players?.max || state.maxPlayers || 20;
+          const count = Math.max(combinedList.length, live?.players?.online || 0, state?.playersOnline || 0);
+          const max = live?.players?.max || state?.maxPlayers || 20;
           if (count === 0 && combinedList.length === 0) {
-            const embed2 = new EmbedBuilder().setColor(7434618).setTitle(`\u{1F465} No Players Online (0/${max})`).setDescription(`There are currently 0 players connected to **${ctx.serverAddress}**.
-The world is quiet and waiting for players to join.`);
-            if (isOnline) {
-              const secs = state.countdownSeconds ?? 360;
+            const embed2 = new EmbedBuilder().setColor(1096065).setTitle(`\u{1F465} No Players Online (0/${max})`).setDescription(`There are currently **0** players connected to **${ctx.serverAddress}**.
+The server is online and ready for players to join!`).setFooter({ text: "Apexion" }).setTimestamp();
+            if (state.countdownActive && typeof state.countdownSeconds === "number" && state.countdownSeconds > 0) {
+              const secs = state.countdownSeconds;
               const mins = Math.floor(secs / 60);
               const s = secs % 60;
               const formatted = state.countdownFormatted || `${mins}:${s < 10 ? "0" : ""}${s}`;
               const targetEpoch = Math.floor(Date.now() / 1e3) + secs;
               embed2.addFields({
                 name: "\u23F1\uFE0F Keepalive Timer",
-                value: `\`${formatted}\` remaining \u2022 Auto-shutdown <t:${targetEpoch}:R>
-*(Synced with Aternos dashboard)*`,
+                value: `\`${formatted}\` remaining \u2022 Auto-shutdown <t:${targetEpoch}:R>`,
                 inline: false
               });
             }
-            embed2.setFooter({ text: "Aternos Command Center", iconURL: this.client.user?.displayAvatarURL() });
-            embed2.setTimestamp();
             await interaction.editReply({ embeds: [embed2] });
-            return;
+            break;
           }
-          const embed = new EmbedBuilder().setColor(1096065).setTitle(`\u{1F465} Online Players (${count}/${max})`).setDescription(`Active players currently connected to **${ctx.serverAddress}**:`).setTimestamp();
-          if (combinedList.length > 0) {
-            const playerLines = combinedList.map((name, idx) => {
-              const headEmoji = this.getPlayerHeadEmoji(name);
+          const embed = new EmbedBuilder().setColor(1096065).setTitle(`\u{1F465} Connected Players (${count}/${max})`).setDescription(`Active players currently connected to **${ctx.serverAddress}**:`).setFooter({ text: "Apexion" }).setTimestamp();
+          const playerLines = await Promise.all(
+            combinedList.map(async (name, idx) => {
+              const headEmoji = await this.ensurePlayerHeadEmoji(name, interaction.guild);
               return `**${idx + 1}.** ${headEmoji} **${name}**`;
-            });
-            embed.addFields({ name: "Connected Players", value: playerLines.join("\n"), inline: false });
-          } else {
-            embed.setDescription(`There ${count === 1 ? "is" : "are"} currently **${count}** player${count > 1 ? "s" : ""} connected to the server.`);
-          }
-          embed.setFooter({
-            text: "Aternos Command Center",
-            iconURL: this.client.user?.displayAvatarURL()
-          });
+            })
+          );
+          embed.addFields({ name: "Player List", value: playerLines.join("\n"), inline: false });
           await interaction.editReply({ embeds: [embed] });
           break;
         }
@@ -2539,10 +2966,7 @@ The world is quiet and waiting for players to join.`);
           await interaction.editReply({ content: "Unknown command." });
       }
     } catch (err) {
-      if (err?.code === 10008 || err?.message?.includes("Unknown Message")) {
-        return;
-      }
-      console.error(`[Discord /${commandName} Error]`, err);
+      console.error(`[Apexion /${commandName} Error]`, err);
       try {
         if (interaction.deferred && !interaction.replied) {
           await interaction.editReply({ content: `\u274C Command Error: ${err.message || "Operation failed"}` });
@@ -2555,26 +2979,35 @@ The world is quiet and waiting for players to join.`);
   }
   // Handle Interactive Select Menu Selection for /configure
   async handleSelectMenu(interaction) {
+    try {
+      if (!interaction.deferred && !interaction.replied) {
+        await interaction.deferUpdate();
+      }
+    } catch (err) {
+      console.warn("[Apexion] Could not defer select menu:", err?.message);
+      return;
+    }
     const { customId, values, user } = interaction;
     const pending = this.pendingSelections.get(customId);
     if (!pending) {
-      await interaction.reply({
+      await interaction.followUp({
         content: "\u26A0\uFE0F This server selection menu has expired. Please run `/configure` again.",
         ephemeral: true
+      }).catch(() => {
       });
       return;
     }
     const selectedId = values[0];
     const chosenServer = pending.servers.find((s) => s.id === selectedId);
     if (!chosenServer) {
-      await interaction.reply({
+      await interaction.followUp({
         content: "\u26A0\uFE0F Selected server was not found.",
         ephemeral: true
+      }).catch(() => {
       });
       return;
     }
     try {
-      await interaction.deferUpdate();
       const canonicalAddr = serverStorage.getCanonicalServerAddress(chosenServer.serverAddress);
       serverStorage.setDiscordBinding({
         guildIdOrUserId: pending.contextId,
@@ -2584,6 +3017,16 @@ The world is quiet and waiting for players to join.`);
         configuredBy: pending.userName,
         updatedAt: Date.now()
       });
+      if (pending.guildId && pending.guildId !== pending.contextId) {
+        serverStorage.setDiscordBinding({
+          guildIdOrUserId: pending.guildId,
+          serverAddress: canonicalAddr,
+          sessionCookie: pending.session,
+          serverCookie: chosenServer.serverCookie,
+          configuredBy: pending.userName,
+          updatedAt: Date.now()
+        });
+      }
       if (pending.userId !== pending.contextId) {
         serverStorage.setDiscordBinding({
           guildIdOrUserId: pending.userId,
@@ -2606,7 +3049,7 @@ The world is quiet and waiting for players to join.`);
         status: "success",
         message: `Selected and bound ${canonicalAddr}`
       });
-      const embed = new EmbedBuilder().setColor(1096065).setTitle("\u2705 Aternos Server Linked Successfully").setDescription(`Successfully linked **${canonicalAddr}** (ID: \`${chosenServer.id}\`) to this Discord server.
+      const embed = new EmbedBuilder().setColor(1096065).setTitle("\u2705 Aternos Server Linked Successfully").setDescription(`Successfully linked **${canonicalAddr}** (ID: \`${chosenServer.id}\`) to Apexion.
 You can now control your server directly!`).addFields(
         { name: "\u{1F310} Server Address", value: `\`${canonicalAddr}\``, inline: true },
         { name: "\u{1F511} Server ID", value: `\`${chosenServer.id}\``, inline: true },
@@ -2615,20 +3058,19 @@ You can now control your server directly!`).addFields(
           name: "\u{1F3AE} Control Commands",
           value: "`/status` \u2014 Check online status & player count\n`/players` \u2014 View online players\n`/start` \u2014 Turn on server\n`/stop` \u2014 Turn off server\n`/restart` \u2014 Reboot server"
         }
-      ).setFooter({ text: "Aternos Command Center", iconURL: this.client.user?.displayAvatarURL() }).setTimestamp();
+      ).setFooter({ text: "Apexion" }).setTimestamp();
       await interaction.editReply({ embeds: [embed], components: [] });
       this.pendingSelections.delete(customId);
-      this.userLastInteractions.set(user.id, [
-        { interaction, timestamp: Date.now() }
-      ]);
     } catch (err) {
-      console.error("[Select Menu Error]", err);
+      console.error("[Apexion Select Menu Error]", err);
     }
   }
   getBotStatus() {
     return {
       isReady: this.isReady,
-      botTag: this.botTag || (this.isReady ? "Aternos#3859" : "Connecting..."),
+      currentEnv: CURRENT_ENV,
+      activeTarget: serverStorage.getBotTarget(),
+      botTag: this.botTag || (this.isReady ? "Apexion#3859" : "Standby / Disconnected"),
       botId: this.botId,
       guildsCount: this.client.guilds?.cache?.size || 0,
       ping: this.client.ws?.ping || this.lastPing || 0,
@@ -2642,17 +3084,19 @@ var discordBot = new DiscordBotService();
 
 // server.ts
 var __filename = fileURLToPath(import.meta.url);
-var __dirname = path3.dirname(__filename);
+var __dirname = path4.dirname(__filename);
 var ADMIN_USERNAME = "Shifin";
 var ADMIN_PASSWORD = "0508552513";
 var ADMIN_TOKEN = "shifin-auth-session-key-0508552513";
 async function startServer() {
   const app = express();
-  const PORT = 3e3;
+  const PORT = parseInt(process.env.PORT || "3000", 10);
   app.use(express.json());
   app.get("/api/status", (req, res) => {
     const serverParam = req.query.server?.toLowerCase();
     const shouldRefresh = req.query.refresh === "true";
+    const token = req.headers["x-admin-token"] || req.query.admin_token;
+    const isAdmin = token === ADMIN_TOKEN;
     if (serverParam) {
       if (shouldRefresh) {
         aternosService.syncSessionState(serverParam).catch(() => {
@@ -2661,7 +3105,7 @@ async function startServer() {
       const specificState = aternosService.getState(serverParam);
       res.json({
         ...specificState,
-        allServerStates: aternosService.getAllStates()
+        allServerStates: isAdmin ? aternosService.getAllStates() : { [serverParam]: specificState }
       });
       return;
     }
@@ -2670,15 +3114,19 @@ async function startServer() {
       });
     }
     const activeState = aternosService.getState();
-    const allServerStates = aternosService.getAllStates();
     res.json({
       ...activeState,
-      allServerStates
+      allServerStates: isAdmin ? aternosService.getAllStates() : {}
     });
   });
   app.get("/api/servers", (req, res) => {
-    const all = serverStorage.getAllProfiles();
-    res.json(all.length > 0 ? all : aternosService.getServersList());
+    const token = req.headers["x-admin-token"] || req.query.admin_token;
+    if (token === ADMIN_TOKEN) {
+      const all = serverStorage.getAllProfiles();
+      res.json(all);
+    } else {
+      res.json([]);
+    }
   });
   app.get("/api/servers/status", (req, res) => {
     res.json(aternosService.getAllStates());
@@ -2776,6 +3224,17 @@ async function startServer() {
     }
     res.json({ success: true, message: "Settings updated successfully." });
   });
+  app.get("/api/system/info", async (req, res) => {
+    const redisHealth = await getRedisHealth();
+    res.json({
+      name: "Apexion",
+      environment: CURRENT_ENV,
+      storageNamespace: DATA_PREFIX,
+      redisHealth,
+      botStatus: discordBot.getBotStatus(),
+      uptime: process.uptime()
+    });
+  });
   app.post("/api/servers/sync", async (req, res) => {
     const { servers } = req.body || {};
     if (Array.isArray(servers)) {
@@ -2783,6 +3242,23 @@ async function startServer() {
       await aternosService.syncProfiles(servers);
     }
     res.json({ success: true, count: servers?.length || 0 });
+  });
+  app.post("/api/user/sync", async (req, res) => {
+    const { servers } = req.body || {};
+    if (Array.isArray(servers)) {
+      serverStorage.syncFromClient(servers, "web");
+      await aternosService.syncProfiles(servers);
+    }
+    res.json({ success: true, count: servers?.length || 0 });
+  });
+  app.get("/api/user/profiles", (req, res) => {
+    const token = req.headers["x-admin-token"] || req.query.admin_token;
+    if (token === ADMIN_TOKEN) {
+      const all = serverStorage.getAllProfiles();
+      res.json({ success: true, servers: all });
+    } else {
+      res.json({ success: true, servers: [] });
+    }
   });
   app.post("/api/server/detect", async (req, res) => {
     const ac = new AbortController();
@@ -2841,6 +3317,7 @@ async function startServer() {
         rawStatus: st?.rawStatus || "Unknown",
         countdownFormatted: st?.countdownFormatted,
         playersOnline: st?.playersOnline,
+        playerList: st?.playerList || [],
         maxPlayers: st?.maxPlayers,
         dynip: st?.dynip
       };
@@ -2883,13 +3360,39 @@ async function startServer() {
     }
     res.json(result);
   });
-  app.get("/api/admin/bot-status", verifyAdmin, (req, res) => {
+  app.get("/api/admin/bot-status", verifyAdmin, async (req, res) => {
+    const redisHealth = await getRedisHealth();
     res.json({
       success: true,
+      redisHealth,
       ...discordBot.getBotStatus()
     });
   });
-  const isProduction = process.env.NODE_ENV === "production" || __filename.endsWith("server.js") || !fs3.existsSync(path3.resolve(__dirname, "node_modules/vite"));
+  app.get("/api/admin/bot-mode", verifyAdmin, (req, res) => {
+    res.json({
+      success: true,
+      activeTarget: serverStorage.getBotTarget(),
+      currentEnv: discordBot.getBotStatus().currentEnv,
+      isBotRunning: discordBot.getBotStatus().isReady,
+      botTag: discordBot.getBotStatus().botTag
+    });
+  });
+  app.post("/api/admin/bot-mode", verifyAdmin, async (req, res) => {
+    const { target } = req.body || {};
+    if (target !== "dev" && target !== "published" && target !== "disabled") {
+      res.status(400).json({ success: false, message: 'Invalid target. Must be "dev", "published", or "disabled".' });
+      return;
+    }
+    await discordBot.setTargetMode(target);
+    res.json({
+      success: true,
+      message: `Discord bot target globally set to "${target.toUpperCase()}" via Upstash Redis.`,
+      activeTarget: target,
+      currentEnv: discordBot.getBotStatus().currentEnv,
+      isBotRunning: discordBot.getBotStatus().isReady
+    });
+  });
+  const isProduction = process.env.NODE_ENV === "production" || __filename.endsWith("server.js") || !fs4.existsSync(path4.resolve(__dirname, "node_modules/vite"));
   if (!isProduction) {
     const { createServer } = await import("vite");
     const vite = await createServer({
@@ -2898,17 +3401,17 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = path3.resolve(__dirname, "dist");
+    const distPath = path4.resolve(__dirname, "dist");
     app.use(express.static(distPath));
     app.get("*", (req, res) => {
-      res.sendFile(path3.resolve(distPath, "index.html"));
+      res.sendFile(path4.resolve(distPath, "index.html"));
     });
   }
   discordBot.start().catch((err) => {
-    console.warn("[Discord Bot] Startup warning:", err?.message);
+    console.warn("[Apexion Bot] Startup notice:", err?.message);
   });
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`[Aternos Command Center] Server listening on http://0.0.0.0:${PORT}`);
+    console.log(`[Apexion] Server listening on http://0.0.0.0:${PORT} [${CURRENT_ENV.toUpperCase()}]`);
   });
 }
 startServer().catch((err) => {

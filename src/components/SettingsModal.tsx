@@ -13,7 +13,7 @@ interface SettingsModalProps {
 
 const DEFAULT_SESSION = '';
 const DEFAULT_SERVER = '';
-const DEFAULT_ADDRESS = 'myserver.aternos.me';
+const DEFAULT_ADDRESS = '';
 
 export const SettingsModal: React.FC<SettingsModalProps> = ({
   isOpen,

@@ -87,8 +87,8 @@ export const ManageServersModal: React.FC<ManageServersModalProps> = ({
   const startCreate = () => {
     setEditingId(null);
     setIsAddingNew(true);
-    setDisplayName(`Server ${servers.length + 1}`);
-    setServerAddress(`server${servers.length + 1}.aternos.me`);
+    setDisplayName('');
+    setServerAddress('');
     setServerPort('25565');
     setSoftware('Paper / Bukkit');
     setVersion('1.20.4');

@@ -103,19 +103,28 @@ export const TopBar: React.FC<TopBarProps> = ({
 
         {/* Action Buttons */}
         <div className="flex items-center gap-2 shrink-0">
-          {(onOpenAdminPanel || onTriggerAdmin) && (
+          {isAdminLoggedIn ? (
             <motion.button
               whileHover={{ scale: 1.02 }}
               whileTap={{ scale: 0.95 }}
               onClick={() => {
-                if (onOpenAdminPanel) {
-                  onOpenAdminPanel();
-                } else if (onTriggerAdmin) {
-                  onTriggerAdmin();
-                }
+                if (onOpenAdminPanel) onOpenAdminPanel();
               }}
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-bold text-emerald-300 bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/30 transition-all cursor-pointer shadow-sm"
               title="Open Admin Command Center"
+            >
+              <ShieldCheck className="w-3.5 h-3.5" />
+              <span>Admin Panel</span>
+            </motion.button>
+          ) : (
+            <motion.button
+              whileHover={{ scale: 1.02 }}
+              whileTap={{ scale: 0.95 }}
+              onClick={() => {
+                if (onTriggerAdmin) onTriggerAdmin();
+              }}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold text-zinc-400 hover:text-zinc-200 bg-zinc-900/60 hover:bg-zinc-800 border border-white/5 hover:border-white/10 transition-all cursor-pointer"
+              title="Administrator Login"
             >
               <ShieldCheck className="w-3.5 h-3.5" />
               <span>Admin</span>

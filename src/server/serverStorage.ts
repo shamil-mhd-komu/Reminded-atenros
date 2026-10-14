@@ -205,7 +205,6 @@ class ServerStorageManager {
       this.ensureDataDir();
       const list = Array.from(this.profiles.values());
       fs.writeFileSync(this.storageFilePath, JSON.stringify(list, null, 2), 'utf-8');
-      fs.writeFileSync('./servers-config.json', JSON.stringify(list, null, 2), 'utf-8');
     } catch (err: any) {
       console.warn('Could not save server profiles to disk:', err?.message);
     }
@@ -305,7 +304,7 @@ class ServerStorageManager {
 
   // Canonical server address lookup preserving proper casing
   public getCanonicalServerAddress(query: string): string {
-    if (!query) return 'Bang_Bros_SMP.aternos.me';
+    if (!query) return '';
     const clean = query.trim();
     const normalize = (s: string) => s.toLowerCase().replace(/[-_\s]/g, '').replace(/\.aternos\.me$/i, '');
     const norm = normalize(clean);

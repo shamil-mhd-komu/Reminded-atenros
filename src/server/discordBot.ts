@@ -358,9 +358,8 @@ export class DiscordBotService {
       };
     }
 
-    const defaultCanonical = 'Bang_Bros_SMP.aternos.me';
     return {
-      serverAddress: defaultCanonical,
+      serverAddress: '',
       sessionCookie: '',
       serverCookie: '',
     };
