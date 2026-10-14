@@ -27,17 +27,17 @@ const STORAGE_ADMIN_USER_KEY = 'aternos_admin_user';
 const INITIAL_STATE: AternosState = {
   status: 'offline',
   rawStatus: 'Offline',
-  serverIp: 'Bang_Bros_SMP.aternos.me',
-  serverPort: '25565',
-  software: 'Paper / Bukkit',
-  version: '1.20.4',
+  serverIp: '',
+  serverPort: '',
+  software: '',
+  version: '',
   queuePosition: null,
   queueEta: null,
   countdownSeconds: null,
   countdownFormatted: null,
   countdownActive: false,
   canExtend: false,
-  startVisible: true,
+  startVisible: false,
   stopVisible: false,
   restartVisible: false,
   extendVisible: false,
@@ -76,15 +76,15 @@ export default function App() {
   const [isAdminPanelOpen, setIsAdminPanelOpen] = useState(false);
   const [adminToken, setAdminToken] = useState<string>(() => {
     try {
-      return localStorage.getItem(STORAGE_ADMIN_TOKEN_KEY) || MASTER_ADMIN_TOKEN;
+      return localStorage.getItem(STORAGE_ADMIN_TOKEN_KEY) || '';
     } catch {}
-    return MASTER_ADMIN_TOKEN;
+    return '';
   });
   const [adminUsername, setAdminUsername] = useState<string>(() => {
     try {
-      return localStorage.getItem(STORAGE_ADMIN_USER_KEY) || 'Admin';
+      return localStorage.getItem(STORAGE_ADMIN_USER_KEY) || '';
     } catch {}
-    return 'Admin';
+    return '';
   });
 
   const activeServer: ServerProfile | null =
@@ -144,10 +144,13 @@ export default function App() {
     setToasts(prev => prev.filter(t => t.id !== id));
   };
 
-  // Seamlessly restore persisted server profiles from backend (Upstash Redis) on mount
+  // Restore persisted server profiles ONLY if admin is authenticated
   useEffect(() => {
+    if (!adminToken) return;
     let isMounted = true;
-    fetch('/api/user/profiles')
+    fetch('/api/user/profiles', {
+      headers: { 'x-admin-token': adminToken },
+    })
       .then(res => res.json())
       .then(data => {
         if (!isMounted) return;
@@ -159,7 +162,7 @@ export default function App() {
             for (const s of prev) {
               if (s && s.id) map.set(s.id, s);
             }
-            // Add or merge remote persistent profiles
+            // Add remote persistent profiles
             for (const s of remoteServers) {
               if (s && s.id) {
                 const existing = map.get(s.id);
@@ -183,21 +186,24 @@ export default function App() {
     return () => {
       isMounted = false;
     };
-  }, []);
+  }, [adminToken]);
 
-  // Persist servers changes to user's localStorage and sync with backend
+  // Persist servers changes to user's localStorage (and backend if admin)
   useEffect(() => {
     try {
       localStorage.setItem(STORAGE_SERVERS_KEY, JSON.stringify(servers));
-      if (servers.length > 0) {
+      if (adminToken && servers.length > 0) {
         fetch('/api/servers/sync', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'x-admin-token': adminToken,
+          },
           body: JSON.stringify({ servers }),
         }).catch(() => {});
       }
     } catch {}
-  }, [servers]);
+  }, [servers, adminToken]);
 
   // Persist active server ID
   useEffect(() => {

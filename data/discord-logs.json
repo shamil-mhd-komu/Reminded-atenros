@@ -1,6 +1,60 @@
 [
   {
     "user": "Aternos#3859",
+    "command": "READY",
+    "serverAddress": "discord.gateway",
+    "status": "success",
+    "message": "Connected in 1 server(s) [DEV]",
+    "id": "1791986669451-8nho",
+    "timestamp": "14:04:29"
+  },
+  {
+    "user": "Aternos#3859",
+    "command": "STANDBY",
+    "serverAddress": "discord.gateway",
+    "status": "warning",
+    "message": "Bot on standby in dev",
+    "id": "1791985915587-0hen",
+    "timestamp": "13:51:55"
+  },
+  {
+    "user": "Aternos#3859",
+    "command": "READY",
+    "serverAddress": "discord.gateway",
+    "status": "success",
+    "message": "Connected in 1 server(s) [DEV]",
+    "id": "1791985830045-qhdr",
+    "timestamp": "13:50:30"
+  },
+  {
+    "user": "Aternos#3859",
+    "command": "READY",
+    "serverAddress": "discord.gateway",
+    "status": "success",
+    "message": "Connected in 1 server(s) [DEV]",
+    "id": "1791985817448-26xq",
+    "timestamp": "13:50:17"
+  },
+  {
+    "user": "fliesh_yy4831",
+    "command": "/configure [SELECT]",
+    "serverAddress": "Narendra_Mundi.aternos.me",
+    "status": "success",
+    "message": "Selected and bound Narendra_Mundi.aternos.me",
+    "id": "1791985438166-cnck",
+    "timestamp": "13:43:58"
+  },
+  {
+    "user": "Aternos#3859",
+    "command": "READY",
+    "serverAddress": "discord.gateway",
+    "status": "success",
+    "message": "Connected in 1 server(s) [DEV]",
+    "id": "1791985391547-7aev",
+    "timestamp": "13:43:11"
+  },
+  {
+    "user": "Aternos#3859",
     "command": "STOP",
     "serverAddress": "discord.gateway",
     "status": "warning",

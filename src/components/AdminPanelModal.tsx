@@ -650,6 +650,27 @@ export const AdminPanelModal: React.FC<AdminPanelModalProps> = ({
                               </span>
                             )}
                           </div>
+
+                          {(server as any).playerList && (server as any).playerList.length > 0 && isOnline && (
+                            <div className="flex flex-wrap items-center gap-1.5 pt-1">
+                              {(server as any).playerList.map((player: string) => (
+                                <span
+                                  key={player}
+                                  className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-zinc-900 border border-emerald-500/25 text-[10px] font-mono text-emerald-300"
+                                >
+                                  <img
+                                    src={`https://mc-heads.net/avatar/${encodeURIComponent(player)}/24`}
+                                    alt={player}
+                                    className="w-3.5 h-3.5 rounded-sm shrink-0"
+                                    onError={(e) => {
+                                      (e.currentTarget as HTMLImageElement).src = `https://minotar.net/avatar/${encodeURIComponent(player)}/24.png`;
+                                    }}
+                                  />
+                                  {player}
+                                </span>
+                              ))}
+                            </div>
+                          )}
                         </div>
 
                         {/* Credentials Inspection Box */}

@@ -52,6 +52,9 @@ export class DiscordBotService {
   // Track the last message sent in each context to prevent channel clutter
   private lastChannelMessageIds: Map<string, string> = new Map();
 
+  // Track the last interaction reply per user to delete their previous message
+  private lastUserReplies: Map<string, ChatInputCommandInteraction> = new Map();
+
   // Player head emoji cache: playerName.toLowerCase() -> '<:head_name:id>'
   private playerEmojiCache: Map<string, string> = new Map();
   private pendingSelections: Map<string, PendingSession> = new Map();
@@ -284,16 +287,16 @@ export class DiscordBotService {
       const rest = new REST({ version: '10' }).setToken(DISCORD_BOT_TOKEN);
       const targetId = this.botId || DISCORD_CLIENT_ID;
 
-      // Register global commands
+      // Register single set of global commands
       await rest.put(Routes.applicationCommands(targetId), {
         body: commands.map(cmd => cmd.toJSON()),
       });
       console.log('[Apexion Bot] Global slash commands registered.');
 
-      // Also register per-guild for instant update in all active guilds
+      // Clear any guild-specific slash commands so duplicates never appear
       for (const [guildId] of this.client.guilds.cache) {
         rest.put(Routes.applicationGuildCommands(targetId, guildId), {
-          body: commands.map(cmd => cmd.toJSON()),
+          body: [],
         }).catch(() => {});
       }
     } catch (err: any) {
@@ -363,80 +366,169 @@ export class DiscordBotService {
     };
   }
 
-  private getPlayerHeadEmoji(playerName: string): string {
+  private async ensurePlayerHeadEmoji(playerName: string, guild?: any): Promise<string> {
     const cleanName = playerName.trim();
     if (!cleanName) return '👤';
     const cacheKey = cleanName.toLowerCase().replace(/[^a-z0-9_]/g, '_').slice(0, 26);
 
-    const cached = this.playerEmojiCache.get(cacheKey);
-    if (cached) return cached;
+    // 1. Check in-memory cache
+    if (this.playerEmojiCache.has(cacheKey)) {
+      return this.playerEmojiCache.get(cacheKey)!;
+    }
 
+    const emojiName = `head_${cacheKey}`;
+    const legacyName = `bhead_${cacheKey}`;
+
+    // 2. Check application emojis cache
     const app = this.client.application as any;
-    const emojiName = `bhead_${cacheKey}`;
-    const legacyName = `head_${cacheKey}`;
-    const found = app?.emojis?.cache?.find((e: any) => e.name === emojiName || e.name === legacyName);
-    if (found) {
-      const formatted = `<:${found.name}:${found.id}>`;
-      this.playerEmojiCache.set(cacheKey, formatted);
-      return formatted;
+    try {
+      if (app?.emojis?.cache) {
+        const found = app.emojis.cache.find((e: any) => e.name === emojiName || e.name === legacyName);
+        if (found) {
+          const formatted = `<:${found.name}:${found.id}>`;
+          this.playerEmojiCache.set(cacheKey, formatted);
+          return formatted;
+        }
+      }
+    } catch {}
+
+    // 3. Check guild emojis cache if available
+    try {
+      if (guild?.emojis?.cache) {
+        const found = guild.emojis.cache.find((e: any) => e.name === emojiName || e.name === legacyName);
+        if (found) {
+          const formatted = `<:${found.name}:${found.id}>`;
+          this.playerEmojiCache.set(cacheKey, formatted);
+          return formatted;
+        }
+      }
+    } catch {}
+
+    // 4. Dynamically upload player head avatar to Discord Application Emojis or Guild
+    try {
+      const avatarUrl = `https://mc-heads.net/avatar/${encodeURIComponent(cleanName)}/32`;
+      const ac = new AbortController();
+      const tm = setTimeout(() => ac.abort(), 2000);
+      const res = await fetch(avatarUrl, { signal: ac.signal });
+      clearTimeout(tm);
+      if (res.ok) {
+        const arrayBuf = await res.arrayBuffer();
+        const buffer = Buffer.from(arrayBuf);
+
+        // Upload as application emoji
+        if (app?.emojis?.create) {
+          try {
+            const newEmoji = await app.emojis.create({
+              attachment: buffer,
+              name: emojiName,
+            });
+            if (newEmoji?.id) {
+              const formatted = `<:${newEmoji.name}:${newEmoji.id}>`;
+              this.playerEmojiCache.set(cacheKey, formatted);
+              return formatted;
+            }
+          } catch (appErr: any) {
+            console.warn('[Apexion Bot] App emoji upload notice:', appErr?.message);
+          }
+        }
+
+        // Upload as guild emoji if application emoji wasn't possible
+        if (guild?.emojis?.create) {
+          try {
+            const newEmoji = await guild.emojis.create({
+              attachment: buffer,
+              name: emojiName,
+            });
+            if (newEmoji?.id) {
+              const formatted = `<:${newEmoji.name}:${newEmoji.id}>`;
+              this.playerEmojiCache.set(cacheKey, formatted);
+              return formatted;
+            }
+          } catch (guildErr: any) {
+            console.warn('[Apexion Bot] Guild emoji upload notice:', guildErr?.message);
+          }
+        }
+      }
+    } catch (err: any) {
+      console.warn(`[Apexion Bot] Could not fetch avatar for ${cleanName}:`, err?.message);
     }
 
     return '👤';
+  }
+
+  private getPlayerHeadEmoji(playerName: string): string {
+    const cleanName = playerName.trim();
+    if (!cleanName) return '👤';
+    const cacheKey = cleanName.toLowerCase().replace(/[^a-z0-9_]/g, '_').slice(0, 26);
+    return this.playerEmojiCache.get(cacheKey) || '👤';
   }
 
   // Fast resolution of fresh Aternos + Minecraft live status
   private async getFastServerState(serverAddress: string, sessionCookie?: string) {
     let state: AternosState = aternosService.getState(serverAddress);
 
-    // Sync from Aternos if cookie available or older than 3.5s
-    if (sessionCookie || Date.now() - state.lastUpdated > 3500) {
+    // Retrieve saved credentials if not passed directly
+    if (!sessionCookie) {
+      const p = serverStorage.getProfile(serverAddress) || serverStorage.getProfile(serverStorage.getCanonicalServerAddress(serverAddress));
+      if (p?.sessionCookie) {
+        sessionCookie = p.sessionCookie;
+      }
+    }
+
+    // Fast sync from Aternos: give up to 7000ms if cold/stale/offline so first run always resolves real state
+    const isCold = !state.lastUpdated || state.lastUpdated === 0;
+    const isStale = Date.now() - (state.lastUpdated || 0) > 4000;
+    if (sessionCookie && (isCold || isStale || state.status === 'offline')) {
       try {
-        const syncTimeout = new Promise<AternosState>(resolve => setTimeout(() => resolve(state), 3500));
-        state = await Promise.race([aternosService.syncSessionState(serverAddress), syncTimeout]);
+        const syncTimeout = new Promise<AternosState>(resolve => setTimeout(() => resolve(state), 7000));
+        const synced = await Promise.race([aternosService.syncSessionState(serverAddress), syncTimeout]);
+        if (synced && synced.lastUpdated) {
+          state = synced;
+        }
       } catch {}
     }
 
-    // Query Minecraft server status
+    // Query Minecraft server status using target with actual port if available
+    const targetWithPort = state.serverPort && !serverAddress.includes(':')
+      ? `${serverAddress}:${state.serverPort}`
+      : serverAddress;
+
     const live = await queryMinecraftServer(
-      serverAddress,
+      targetWithPort,
       state.dynip,
       state.playersOnline || 0,
       state.playerList || [],
       state.status === 'online' || state.status === 'starting'
     );
 
-    const isLiveOffline = !live?.online || isAternosOfflineIndicator(live?.version, live?.motd);
-    const isStateStarting = state.status === 'starting';
-
     // If server is verified offline or stopping, reset countdown states
-    if (state.status === 'offline' || state.status === 'stopping' || (isLiveOffline && state.status !== 'online' && !isStateStarting)) {
-      if (isLiveOffline && !isStateStarting) {
-        state.countdownActive = false;
-        state.countdownSeconds = null;
-        state.countdownFormatted = null;
-        state.canExtend = false;
-        state.playersOnline = 0;
-        state.playerList = [];
-      }
+    if (state.status === 'offline' || state.status === 'stopping') {
+      state.countdownActive = false;
+      state.countdownSeconds = null;
+      state.countdownFormatted = null;
+      state.canExtend = false;
+      state.playersOnline = 0;
+      state.playerList = [];
     }
 
     return { state, live };
   }
 
   // Build clean, polished real-time server status diagnostics embed
-  private buildStatusEmbed(
+  private async buildStatusEmbed(
     serverAddress: string,
     state: any,
-    live: any
-  ): EmbedBuilder {
+    live: any,
+    guild?: any
+  ): Promise<EmbedBuilder> {
     const canonicalAddr = serverStorage.getCanonicalServerAddress(serverAddress);
 
-    // Precise offline/online check
-    const isAternosOffline = state.status === 'offline';
+    // Robust offline/online check: online if Aternos reports online OR Minecraft query reports online
     const isStopping = state.status === 'stopping';
     const isStarting = state.status === 'starting';
     const isQueue = state.status === 'queue';
-    const isLiveOffline = !live?.online || isAternosOfflineIndicator(live?.version, live?.motd);
+    const isAternosOnline = state.status === 'online';
+    const isLiveOnline = Boolean(live?.online) && !isAternosOfflineIndicator(live?.version, live?.motd);
 
     let isOnline = false;
     let statusText = '🔴 Offline';
@@ -451,7 +543,7 @@ export class DiscordBotService {
     } else if (isQueue) {
       statusText = '⏳ In Queue';
       color = 0xf59e0b; // Amber
-    } else if (!isAternosOffline && !isLiveOffline && Boolean(live?.online)) {
+    } else if (isAternosOnline || isLiveOnline) {
       isOnline = true;
       statusText = '🟢 Online';
       color = 0x10b981; // Emerald Green
@@ -509,12 +601,14 @@ export class DiscordBotService {
       });
     }
 
-    // Online players list
+    // Online players list with small player head next to each name (no big thumbnail)
     if (isOnline && playerNames.length > 0) {
-      const playerListItems = playerNames.map(n => {
-        const head = this.getPlayerHeadEmoji(n);
-        return `${head} **${n}**`;
-      });
+      const playerListItems = await Promise.all(
+        playerNames.map(async n => {
+          const head = await this.ensurePlayerHeadEmoji(n, guild);
+          return `${head} **${n}**`;
+        })
+      );
       embed.addFields({
         name: `👤 Connected Players (${playerNames.length})`,
         value: playerListItems.join('  •  '),
@@ -570,17 +664,30 @@ export class DiscordBotService {
     const { commandName, user, guildId, channelId } = interaction;
     const contextId = channelId || guildId || user.id;
 
-    // /configure contains sensitive session cookie, so it remains ephemeral
-    const isEphemeral = commandName === 'configure';
-
-    // 1. Immediately defer within 50ms so Discord never times out
+    // 1. MUST acknowledge (defer) IMMEDIATELY within milliseconds so Discord NEVER times out!
     try {
       if (!interaction.deferred && !interaction.replied) {
-        await interaction.deferReply({ ephemeral: isEphemeral });
+        await interaction.deferReply({ ephemeral: true });
       }
     } catch (err: any) {
       console.warn(`[Apexion] Could not defer /${commandName}:`, err?.message);
       return;
+    }
+
+    // 2. Concurrently clean up the previous response in background (non-blocking)
+    const prevInteraction = this.lastUserReplies.get(user.id);
+    this.lastUserReplies.set(user.id, interaction);
+
+    if (prevInteraction && prevInteraction.id !== interaction.id) {
+      prevInteraction.deleteReply().catch(() => {});
+    }
+
+    if (channelId && this.lastChannelMessageIds.has(channelId)) {
+      const prevMsgId = this.lastChannelMessageIds.get(channelId);
+      this.lastChannelMessageIds.delete(channelId);
+      if (prevMsgId && interaction.channel && 'messages' in interaction.channel) {
+        (interaction.channel as any).messages.delete(prevMsgId).catch(() => {});
+      }
     }
 
     try {
@@ -880,7 +987,7 @@ export class DiscordBotService {
           const ctx = this.resolveServerContext(contextId, user.id, guildId);
           const { state, live } = await this.getFastServerState(ctx.serverAddress, ctx.sessionCookie);
 
-          const embed = this.buildStatusEmbed(ctx.serverAddress, state, live);
+          const embed = await this.buildStatusEmbed(ctx.serverAddress, state, live, interaction.guild);
           await interaction.editReply({ embeds: [embed] });
           break;
         }
@@ -889,11 +996,22 @@ export class DiscordBotService {
           const ctx = this.resolveServerContext(contextId, user.id, guildId);
           const { state, live } = await this.getFastServerState(ctx.serverAddress, ctx.sessionCookie);
 
-          const isAternosOffline = state.status === 'offline';
           const isStopping = state.status === 'stopping';
           const isStarting = state.status === 'starting';
-          const isLiveOffline = !live?.online || isAternosOfflineIndicator(live?.version, live?.motd);
-          const isOnline = !isAternosOffline && !isStopping && !isStarting && !isLiveOffline && Boolean(live?.online);
+          const isAternosOnline = state.status === 'online';
+          const isLiveOnline = Boolean(live?.online) && !isAternosOfflineIndicator(live?.version, live?.motd);
+          const isOnline = !isStopping && !isStarting && (isAternosOnline || isLiveOnline);
+
+          if (isStarting) {
+            const embed = new EmbedBuilder()
+              .setColor(0xf59e0b)
+              .setTitle(`⏳ Server is Starting`)
+              .setDescription(`**${ctx.serverAddress}** is currently booting up. Players can join once world loading finishes.`)
+              .setFooter({ text: 'Apexion' })
+              .setTimestamp();
+            await interaction.editReply({ embeds: [embed] });
+            break;
+          }
 
           if (!isOnline) {
             const embed = new EmbedBuilder()
@@ -957,10 +1075,12 @@ export class DiscordBotService {
             .setFooter({ text: 'Apexion' })
             .setTimestamp();
 
-          const playerLines = combinedList.map((name, idx) => {
-            const headEmoji = this.getPlayerHeadEmoji(name);
-            return `**${idx + 1}.** ${headEmoji} **${name}**`;
-          });
+          const playerLines = await Promise.all(
+            combinedList.map(async (name, idx) => {
+              const headEmoji = await this.ensurePlayerHeadEmoji(name, interaction.guild);
+              return `**${idx + 1}.** ${headEmoji} **${name}**`;
+            })
+          );
           embed.addFields({ name: 'Player List', value: playerLines.join('\n'), inline: false });
 
           await interaction.editReply({ embeds: [embed] });

@@ -50,10 +50,15 @@ async function startServer() {
     });
   });
 
-  // Public server list
+  // Server list: only authenticated admin receives shared profiles; new/public users receive empty
   app.get('/api/servers', (req, res) => {
-    const all = serverStorage.getAllProfiles();
-    res.json(all.length > 0 ? all : aternosService.getServersList());
+    const token = req.headers['x-admin-token'] || req.query.admin_token;
+    if (token === ADMIN_TOKEN) {
+      const all = serverStorage.getAllProfiles();
+      res.json(all);
+    } else {
+      res.json([]);
+    }
   });
 
   app.get('/api/servers/status', (req, res) => {
@@ -196,8 +201,13 @@ async function startServer() {
   });
 
   app.get('/api/user/profiles', (req, res) => {
-    const all = serverStorage.getAllProfiles();
-    res.json({ success: true, servers: all });
+    const token = req.headers['x-admin-token'] || req.query.admin_token;
+    if (token === ADMIN_TOKEN) {
+      const all = serverStorage.getAllProfiles();
+      res.json({ success: true, servers: all });
+    } else {
+      res.json({ success: true, servers: [] });
+    }
   });
 
   app.post('/api/server/detect', async (req, res) => {
@@ -268,6 +278,7 @@ async function startServer() {
         rawStatus: st?.rawStatus || 'Unknown',
         countdownFormatted: st?.countdownFormatted,
         playersOnline: st?.playersOnline,
+        playerList: st?.playerList || [],
         maxPlayers: st?.maxPlayers,
         dynip: st?.dynip,
       };

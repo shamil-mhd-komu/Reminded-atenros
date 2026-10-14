@@ -148,25 +148,32 @@ export const ServerCard: React.FC<ServerCardProps> = ({
             )}
           </div>
 
-          {/* Connected player heads with border */}
+          {/* Connected player heads next to each name */}
           {state.status === 'online' && state.playerList && state.playerList.length > 0 && (
-            <div className="flex items-center gap-2 pt-0.5">
-              <span className="text-xs font-mono text-zinc-400">Online:</span>
-              <div className="flex items-center -space-x-1.5">
-                {state.playerList.slice(0, 10).map((player) => (
-                  <div key={player} className="relative group" title={player}>
+            <div className="space-y-2 pt-1">
+              <div className="flex items-center gap-2 text-xs font-mono text-zinc-400">
+                <span className="inline-block w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                <span>Online Players ({state.playerList.length}):</span>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                {state.playerList.map((player) => (
+                  <div
+                    key={player}
+                    className="inline-flex items-center gap-2 px-2.5 py-1.5 rounded-xl bg-zinc-900/90 border border-emerald-500/25 hover:border-emerald-500/50 text-xs font-mono text-zinc-200 shadow-sm transition-all group"
+                  >
                     <img
                       src={`https://mc-heads.net/avatar/${encodeURIComponent(player)}/32`}
                       alt={player}
-                      className="w-6 h-6 rounded-md border-2 border-zinc-900 ring-2 ring-emerald-400/80 shadow-md object-cover bg-zinc-800"
+                      onError={(e) => {
+                        (e.currentTarget as HTMLImageElement).src = `https://minotar.net/avatar/${encodeURIComponent(player)}/32.png`;
+                      }}
+                      className="w-4 h-4 rounded-sm shadow object-cover bg-zinc-800 ring-1 ring-emerald-500/40 group-hover:ring-emerald-400 shrink-0"
                     />
+                    <span className="font-semibold text-emerald-300 group-hover:text-emerald-200">
+                      {player}
+                    </span>
                   </div>
                 ))}
-                {state.playerList.length > 10 && (
-                  <span className="pl-2 text-xs font-mono text-zinc-400">
-                    +{state.playerList.length - 10}
-                  </span>
-                )}
               </div>
             </div>
           )}
