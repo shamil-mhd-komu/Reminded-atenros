@@ -33,6 +33,14 @@ export function detectEnvironment(): 'dev' | 'published' {
   if (process.env.APPLET_ENV === 'production' || process.env.NODE_ENV === 'production') {
     return 'published';
   }
+  // Deployed Cloud Run container always has K_SERVICE set
+  if (process.env.K_SERVICE) {
+    return 'published';
+  }
+  // Bundled production server is run via 'node server.js'
+  if (process.argv.some(arg => arg.endsWith('server.js') || arg.includes('server.js'))) {
+    return 'published';
+  }
   if (process.env.APPLET_ENV === 'dev' || process.env.NODE_ENV === 'development') {
     return 'dev';
   }
@@ -58,10 +66,20 @@ let lastRedisError: string | null = null;
 let lastHealthyCheck: number = 0;
 let isRedisAvailable: boolean = true;
 
+// Read-cache map with TTL to avoid exceeding Upstash daily rate limits
+const redisReadCache = new Map<string, { value: any; cachedAt: number }>();
+const REDIS_READ_CACHE_TTL_MS = 45000; // 45 seconds read cache
+
 /**
- * Safe Redis helpers with automatic memory-fallback and error recovery
+ * Safe Redis helpers with automatic memory-fallback, read-caching, and error recovery
  */
 export async function getRedisJson<T>(key: string, defaultValue: T): Promise<T> {
+  const now = Date.now();
+  const cachedRead = redisReadCache.get(key);
+  if (cachedRead && now - cachedRead.cachedAt < REDIS_READ_CACHE_TTL_MS) {
+    return (cachedRead.value ?? defaultValue) as T;
+  }
+
   try {
     const raw = await redis.get<any>(key);
     isRedisAvailable = true;
@@ -70,32 +88,34 @@ export async function getRedisJson<T>(key: string, defaultValue: T): Promise<T> 
       // Check in-memory fallback
       const cached = inMemoryFallbackStore.get(key);
       if (cached) {
-        if (!cached.expiresAt || cached.expiresAt > Date.now()) {
+        if (!cached.expiresAt || cached.expiresAt > now) {
+          redisReadCache.set(key, { value: cached.value, cachedAt: now });
           return cached.value as T;
         }
         inMemoryFallbackStore.delete(key);
       }
+      redisReadCache.set(key, { value: defaultValue, cachedAt: now });
       return defaultValue;
     }
+
+    let parsedVal: any = raw;
     if (typeof raw === 'string') {
       try {
-        const parsed = JSON.parse(raw);
-        inMemoryFallbackStore.set(key, { value: parsed });
-        return parsed as T;
+        parsedVal = JSON.parse(raw);
       } catch {
-        inMemoryFallbackStore.set(key, { value: raw });
-        return raw as unknown as T;
+        parsedVal = raw;
       }
     }
-    inMemoryFallbackStore.set(key, { value: raw });
-    return raw as T;
+    inMemoryFallbackStore.set(key, { value: parsedVal });
+    redisReadCache.set(key, { value: parsedVal, cachedAt: now });
+    return parsedVal as T;
   } catch (err: any) {
     isRedisAvailable = false;
     lastRedisError = err?.message || 'Redis connection failed';
     // Fall back to in-memory store
     const cached = inMemoryFallbackStore.get(key);
     if (cached) {
-      if (!cached.expiresAt || cached.expiresAt > Date.now()) {
+      if (!cached.expiresAt || cached.expiresAt > now) {
         return cached.value as T;
       }
       inMemoryFallbackStore.delete(key);
@@ -108,6 +128,7 @@ export async function setRedisJson(key: string, value: any, ttlSeconds?: number)
   // Always update in-memory fallback cache first
   const expiresAt = ttlSeconds && ttlSeconds > 0 ? Date.now() + ttlSeconds * 1000 : undefined;
   inMemoryFallbackStore.set(key, { value, expiresAt });
+  redisReadCache.set(key, { value, cachedAt: Date.now() });
 
   try {
     const serialized = typeof value === 'string' ? value : JSON.stringify(value);

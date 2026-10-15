@@ -240,7 +240,7 @@ export async function queryMinecraftServer(
   const cached = pingCache.get(cacheKey);
   const now = Date.now();
 
-  if (cached && now - cached.time < 5000) {
+  if (cached && now - cached.time < 12000) {
     return cached.result;
   }
 
@@ -263,12 +263,37 @@ export async function queryMinecraftServer(
       if (dynip && dynip.trim()) targets.push(parseAddress(dynip.trim()));
       if (serverAddress && serverAddress.trim()) targets.push(parseAddress(serverAddress.trim()));
 
-      const tasks: Promise<PingResult | null>[] = [];
+      // STEP 1: Fast parallel direct TCP checks (concurrent, sub-450ms)
+      const tcpPromises = targets.map(async t => {
+        try {
+          const directRes = await pingMinecraftDirect(t.host, t.port, 450);
+          if (directRes && directRes.online && !isAternosOfflineIndicator(directRes.version, directRes.motd)) {
+            return directRes;
+          }
+        } catch {}
+        return null;
+      });
 
-      // Direct TCP checks
-      for (const t of targets) {
-        tasks.push(pingMinecraftDirect(t.host, t.port, 1200));
+      const tcpResults = await Promise.all(tcpPromises);
+      for (const res of tcpResults) {
+        if (res && res.online) {
+          pingCache.set(cacheKey, { time: Date.now(), result: res });
+          return res;
+        }
       }
+
+      // If Aternos has already confirmed server is offline or stopping, don't stall on external HTTP queries
+      if (!fallbackOnline) {
+        const offlineResult: PingResult = {
+          online: false,
+          players: { online: 0, max: 20, list: [] },
+        };
+        pingCache.set(cacheKey, { time: Date.now(), result: offlineResult });
+        return offlineResult;
+      }
+
+      // STEP 2: Fallback to fast external HTTP checks (850ms timeout)
+      const tasks: Promise<PingResult | null>[] = [];
 
       // Fast mcstatus.io fetch
       for (const t of targets) {
@@ -277,7 +302,7 @@ export async function queryMinecraftServer(
           (async (): Promise<PingResult | null> => {
             try {
               const ac = new AbortController();
-              const tm = setTimeout(() => ac.abort(), 2500);
+              const tm = setTimeout(() => ac.abort(), 850);
               const res = await fetch(`https://api.mcstatus.io/v2/status/java/${encodeURIComponent(targetStr)}`, {
                 signal: ac.signal,
               });
@@ -333,7 +358,7 @@ export async function queryMinecraftServer(
           (async (): Promise<PingResult | null> => {
             try {
               const ac = new AbortController();
-              const tm = setTimeout(() => ac.abort(), 2500);
+              const tm = setTimeout(() => ac.abort(), 850);
               const res = await fetch(`https://api.mcsrvstat.us/3/${encodeURIComponent(targetStr)}`, {
                 signal: ac.signal,
               });
@@ -393,7 +418,7 @@ export async function queryMinecraftServer(
             version: '● Offline',
             motd: 'This server is offline.',
           };
-          pingCache.set(cacheKey, { time: now, result: offlineRes });
+          pingCache.set(cacheKey, { time: Date.now(), result: offlineRes });
           return offlineRes;
         }
 
@@ -409,15 +434,12 @@ export async function queryMinecraftServer(
             }
           }
           onlineResult.players.online = Math.max(onlineResult.players.online, onlineResult.players.list.length, fallbackCount);
-          pingCache.set(cacheKey, { time: now, result: onlineResult });
+          pingCache.set(cacheKey, { time: Date.now(), result: onlineResult });
           return onlineResult;
         }
       } catch {}
 
       // If direct ping and external APIs all failed, server is unreachable / offline
-      const isServerOnline = false;
-      const listFromFallback: PingPlayer[] = [];
-
       const fallbackResult: PingResult = {
         online: false,
         players: {
@@ -428,7 +450,7 @@ export async function queryMinecraftServer(
         version: '● Offline',
         motd: 'This server is offline.',
       };
-      pingCache.set(cacheKey, { time: now, result: fallbackResult });
+      pingCache.set(cacheKey, { time: Date.now(), result: fallbackResult });
       return fallbackResult;
     } finally {
       inFlightPings.delete(cacheKey);

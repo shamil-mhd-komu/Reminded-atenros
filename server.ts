@@ -391,13 +391,23 @@ async function startServer() {
     });
   }
 
-  // Start Discord Bot in background (checks Upstash Redis leader mode)
-  discordBot.start().catch(err => {
-    console.warn('[Apexion Bot] Startup notice:', err?.message);
-  });
+  // Start Discord Bot ONLY in published/production environment!
+  // In dev/preview, the bot is kept completely OFF to prevent duplicate connections or clashing with the published bot
+  if (CURRENT_ENV === 'published') {
+    discordBot.start().catch(err => {
+      console.warn('[Apexion Bot] Startup notice:', err?.message);
+    });
+  } else {
+    console.log('[Apexion Bot] Preview dev server: Discord bot is TURNED OFF to prevent interference with published bot.');
+  }
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`[Apexion] Server listening on http://0.0.0.0:${PORT} [${CURRENT_ENV.toUpperCase()}]`);
+
+    // Self-keepalive ping every 25 seconds to keep Cloud Run container active and prevent Discord WebSocket drops
+    setInterval(() => {
+      fetch(`http://127.0.0.1:${PORT}/api/servers/status`).catch(() => {});
+    }, 25000);
   });
 }
 

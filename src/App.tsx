@@ -65,38 +65,16 @@ export default function App() {
     return '';
   });
 
-  // 1. Multi-Server Profiles State (isolated per user, clean slate for new users)
+  // 1. Multi-Server Profiles State (isolated in user's workspace; all external user profiles stay in Admin Panel)
   const [servers, setServers] = useState<ServerProfile[]>(() => {
     try {
       const saved = localStorage.getItem(STORAGE_SERVERS_KEY);
-      const savedAdminToken = localStorage.getItem(STORAGE_ADMIN_TOKEN_KEY);
       if (saved) {
         const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          // If unauthenticated user, purge any leaked admin servers from earlier sessions
-          if (!savedAdminToken) {
-            const cleaned = parsed.filter(s => {
-              if (!s) return false;
-              const name = String(s.name || s.serverIp || '').toLowerCase();
-              const id = String(s.id || '').toLowerCase();
-              if (
-                name.includes('bang_bros') ||
-                name.includes('bangbros') ||
-                name.includes('narendra') ||
-                id.startsWith('srv-shifin') ||
-                id.startsWith('discord-narendra') ||
-                id.startsWith('discord-bang-bros')
-              ) {
-                return false;
-              }
-              return true;
-            });
-            try {
-              localStorage.setItem(STORAGE_SERVERS_KEY, JSON.stringify(cleaned));
-            } catch {}
-            return cleaned;
-          }
-          return parsed;
+        if (Array.isArray(parsed)) {
+          // Keep all valid server profiles added by the user without arbitrary keyword deletion
+          const valid = parsed.filter(s => Boolean(s && typeof s === 'object' && s.id && (s.serverIp || s.name)));
+          return valid;
         }
       }
     } catch {}
@@ -118,29 +96,9 @@ export default function App() {
   const [serverStates, setServerStates] = useState<Record<string, AternosState>>(() => {
     try {
       const saved = localStorage.getItem(STORAGE_SERVER_STATES_KEY);
-      const savedAdminToken = localStorage.getItem(STORAGE_ADMIN_TOKEN_KEY);
       if (saved) {
         const parsed = JSON.parse(saved);
         if (parsed && typeof parsed === 'object') {
-          if (!savedAdminToken) {
-            const cleaned: Record<string, AternosState> = {};
-            for (const [k, v] of Object.entries(parsed)) {
-              const lower = k.toLowerCase();
-              if (
-                !lower.includes('bang_bros') &&
-                !lower.includes('bangbros') &&
-                !lower.includes('narendra') &&
-                !lower.startsWith('srv-shifin') &&
-                !lower.startsWith('discord-')
-              ) {
-                cleaned[k] = v as AternosState;
-              }
-            }
-            try {
-              localStorage.setItem(STORAGE_SERVER_STATES_KEY, JSON.stringify(cleaned));
-            } catch {}
-            return cleaned;
-          }
           return parsed;
         }
       }
@@ -190,49 +148,7 @@ export default function App() {
     setToasts(prev => prev.filter(t => t.id !== id));
   };
 
-  // Restore persisted server profiles ONLY if admin is authenticated
-  useEffect(() => {
-    if (!adminToken) return;
-    let isMounted = true;
-    fetch('/api/user/profiles', {
-      headers: { 'x-admin-token': adminToken },
-    })
-      .then(res => res.json())
-      .then(data => {
-        if (!isMounted) return;
-        const remoteServers = data?.servers;
-        if (Array.isArray(remoteServers) && remoteServers.length > 0) {
-          setServers(prev => {
-            const map = new Map<string, ServerProfile>();
-            // Add existing state profiles
-            for (const s of prev) {
-              if (s && s.id) map.set(s.id, s);
-            }
-            // Add remote persistent profiles
-            for (const s of remoteServers) {
-              if (s && s.id) {
-                const existing = map.get(s.id);
-                map.set(s.id, {
-                  ...existing,
-                  ...s,
-                  sessionCookie: (s.sessionCookie && !s.sessionCookie.includes('...')) ? s.sessionCookie : existing?.sessionCookie || '',
-                });
-              }
-            }
-            const merged = Array.from(map.values());
-            if (merged.length > 0 && !activeServerId) {
-              setActiveServerId(merged[0].id);
-            }
-            return merged;
-          });
-        }
-      })
-      .catch(() => {});
-
-    return () => {
-      isMounted = false;
-    };
-  }, [adminToken]);
+  // Note: All user server profiles stay strictly in the Admin Panel and are never mixed with main manager servers
 
   // Persist servers changes to user's localStorage (and backend if admin)
   useEffect(() => {
@@ -1002,21 +918,10 @@ export default function App() {
             const existing = servers.find(s => s.id === selectedProfile.id || s.serverIp === selectedProfile.serverIp);
             if (existing) {
               setActiveServerId(existing.id);
+              addToast('success', `Switched active view to ${selectedProfile.serverIp}`);
             } else {
-              const newProfile: ServerProfile = {
-                id: selectedProfile.id,
-                name: selectedProfile.name || selectedProfile.serverIp,
-                serverIp: selectedProfile.serverIp,
-                serverPort: selectedProfile.serverPort || '25565',
-                software: selectedProfile.software || 'Paper / Bukkit',
-                version: selectedProfile.version || '1.20.4',
-                sessionCookie: selectedProfile.sessionCookie || '',
-                serverCookie: selectedProfile.serverCookie || '',
-              };
-              setServers(prev => [newProfile, ...prev]);
-              setActiveServerId(newProfile.id);
+              addToast('info', `${selectedProfile.serverIp} is managed directly in the Admin Command Center.`);
             }
-            addToast('success', `Switched active monitor to ${selectedProfile.serverIp}`);
           }}
           onLogout={() => {
             setAdminToken('');

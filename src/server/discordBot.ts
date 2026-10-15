@@ -9,6 +9,7 @@ import {
   ActionRowBuilder,
   StringSelectMenuBuilder,
   StringSelectMenuOptionBuilder,
+  MessageFlags,
   type ChatInputCommandInteraction,
   type StringSelectMenuInteraction,
 } from 'discord.js';
@@ -62,6 +63,13 @@ export class DiscordBotService {
   constructor() {
     this.client = new Client({
       intents: [GatewayIntentBits.Guilds],
+      ws: {
+        large_threshold: 50,
+      },
+      rest: {
+        timeout: 15000,
+        retries: 3,
+      },
     });
 
     this.setupEventHandlers();
@@ -115,6 +123,15 @@ export class DiscordBotService {
       console.warn('[Apexion Bot Shard Error]:', error?.message);
     });
 
+    this.client.on('shardResume', shardId => {
+      console.log(`[Apexion Bot] Gateway shard ${shardId} resumed session.`);
+      this.isReady = true;
+    });
+
+    this.client.on('shardReconnecting', shardId => {
+      console.log(`[Apexion Bot] Gateway shard ${shardId} reconnecting...`);
+    });
+
     this.client.on('shardDisconnect', (event, shardId) => {
       console.warn(`[Apexion Bot Shard ${shardId} Disconnected] Code: ${event.code}`);
       this.isReady = false;
@@ -124,56 +141,98 @@ export class DiscordBotService {
 
   /**
    * Distributed leader & watchdog loop:
-   * Coordinated via Upstash Redis to ensure Preview (dev) and Published (apexion.ai.studio)
-   * never fight over the bot token or receive conflicting interactions!
+   * Keeps published bot online 24/7. In dev/preview, the bot is dormant and OFF to prevent collisions.
    */
   private startWatchdog() {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
 
+    // In dev environment, never poll or attempt to connect unless explicitly targeted as 'dev'
+    if (CURRENT_ENV === 'dev') {
+      const activeTarget = serverStorage.getBotTarget();
+      if (activeTarget !== 'dev') {
+        console.log(`[Apexion Bot] Preview environment: Discord bot is dormant & OFF.`);
+        return;
+      }
+    }
+
     this.heartbeatTimer = setInterval(async () => {
       try {
         const globalTarget = await getRedisJson<string>(GLOBAL_KEYS.BOT_MODE, 'published');
-        const shouldRunHere = globalTarget === CURRENT_ENV;
+        const isPublishedInstance = CURRENT_ENV === 'published';
+        const isDevInstance = CURRENT_ENV === 'dev';
+
+        // In dev, if target is not 'dev', disconnect immediately and stay off
+        if (isDevInstance && globalTarget !== 'dev') {
+          if (this.isReady || this.client.isReady()) {
+            console.log(`[Apexion Bot Watchdog] Disconnecting dev preview bot to allow published bot uninterrupted control.`);
+            await this.stop().catch(() => {});
+          }
+          return;
+        }
+
+        // Published instance stays active 24/7 unless explicitly disabled
+        const shouldRunHere = globalTarget !== 'disabled' && (
+          (isPublishedInstance && globalTarget !== 'dev') ||
+          (isDevInstance && globalTarget === 'dev') ||
+          (!isPublishedInstance && !isDevInstance)
+        );
 
         if (shouldRunHere) {
-          if (!this.isReady && !this.isExplicitlyStopped) {
-            console.log(`[Apexion Bot Watchdog] This instance (${CURRENT_ENV}) is designated active. Connecting...`);
+          const wsStatus = this.client.ws?.status; // 0 = READY in discord.js
+          if ((!this.isReady || wsStatus !== 0) && !this.isExplicitlyStopped) {
+            console.log(`[Apexion Bot Watchdog] Maintaining active bot connection on ${CURRENT_ENV}...`);
             await this.start().catch(() => {});
           }
-          // Renew active lease in Upstash Redis (TTL 25s)
-          await setRedisJson(GLOBAL_KEYS.BOT_LEADER, { env: CURRENT_ENV, heartbeat: Date.now() }, 25);
+          // Renew active lease in Upstash Redis (TTL 90s)
+          await setRedisJson(GLOBAL_KEYS.BOT_LEADER, { env: CURRENT_ENV, heartbeat: Date.now() }, 90);
         } else {
-          // If we are running but mode points to another instance, gracefully disconnect
           if (this.isReady || this.client.isReady()) {
-            console.log(`[Apexion Bot Watchdog] Active mode is "${globalTarget}". Disconnecting ${CURRENT_ENV} to prevent token collision.`);
+            console.log(`[Apexion Bot Watchdog] Standing down ${CURRENT_ENV} as target is "${globalTarget}".`);
             await this.stop().catch(() => {});
           }
         }
       } catch {}
-    }, 10000);
+    }, 45000);
   }
 
   private scheduleReconnect() {
-    if (this.isExplicitlyStopped) return;
     if (this.reconnectTimer) return;
+
+    // Never auto-reconnect on dev if target is published
+    if (CURRENT_ENV === 'dev') {
+      const activeTarget = serverStorage.getBotTarget();
+      if (activeTarget !== 'dev') return;
+    }
 
     this.reconnectTimer = setTimeout(async () => {
       this.reconnectTimer = null;
-      if (!this.isReady && !this.isExplicitlyStopped && DISCORD_BOT_TOKEN) {
-        const activeTarget = serverStorage.getBotTarget();
-        if (activeTarget === CURRENT_ENV) {
-          console.log(`[Apexion Bot (${CURRENT_ENV})] Attempting gateway reconnect...`);
-          await this.start().catch(() => {});
-        }
-      }
-    }, 5000);
+      if (!DISCORD_BOT_TOKEN) return;
+
+      const activeTarget = serverStorage.getBotTarget();
+      if (activeTarget === 'disabled') return;
+      if (CURRENT_ENV === 'dev' && activeTarget !== 'dev') return;
+
+      this.isExplicitlyStopped = false;
+      console.log(`[Apexion Bot (${CURRENT_ENV})] Reconnecting gateway...`);
+      await this.start().catch(() => {});
+    }, 2000);
   }
 
   public async start(): Promise<void> {
     const activeTarget = serverStorage.getBotTarget();
-    if (activeTarget !== CURRENT_ENV) {
-      console.log(`[Apexion Bot] Standby on ${CURRENT_ENV}. Active target is "${activeTarget}". Bot will not connect here to prevent token collisions.`);
+    if (activeTarget === 'disabled') {
+      console.log(`[Apexion Bot] Bot is explicitly disabled by admin.`);
       this.isExplicitlyStopped = true;
+      return;
+    }
+
+    // In dev/preview, keep bot turned off unless admin explicitly selected 'dev' target
+    if (CURRENT_ENV === 'dev' && activeTarget !== 'dev') {
+      console.log(`[Apexion Bot] Preview dev environment: bot is TURNED OFF to prevent clashing with published bot.`);
+      this.isExplicitlyStopped = true;
+      if (this.isReady || this.client.isReady()) {
+        await this.stop().catch(() => {});
+      }
       return;
     }
 
@@ -182,7 +241,7 @@ export class DiscordBotService {
       return;
     }
 
-    if (this.isReady || this.client.isReady()) {
+    if (this.isReady && this.client.isReady() && this.client.ws?.status === 0) {
       return;
     }
 
@@ -227,8 +286,15 @@ export class DiscordBotService {
 
   public async setTargetMode(target: 'dev' | 'published' | 'disabled'): Promise<void> {
     await serverStorage.setBotTarget(target);
-    if (target === CURRENT_ENV) {
+    const isPublishedInstance = CURRENT_ENV === 'published';
+    const shouldRun = target !== 'disabled' && (
+      (isPublishedInstance && target !== 'dev') ||
+      (!isPublishedInstance && target === 'dev')
+    );
+
+    if (shouldRun) {
       console.log(`[Apexion Bot] Activating on ${CURRENT_ENV}...`);
+      this.isExplicitlyStopped = false;
       await this.start();
     } else {
       console.log(`[Apexion Bot] Standing down on ${CURRENT_ENV} (target is now ${target})...`);
@@ -369,90 +435,7 @@ export class DiscordBotService {
     const cleanName = playerName.trim();
     if (!cleanName) return '👤';
     const cacheKey = cleanName.toLowerCase().replace(/[^a-z0-9_]/g, '_').slice(0, 26);
-
-    // 1. Check in-memory cache
-    if (this.playerEmojiCache.has(cacheKey)) {
-      return this.playerEmojiCache.get(cacheKey)!;
-    }
-
-    const emojiName = `head_${cacheKey}`;
-    const legacyName = `bhead_${cacheKey}`;
-
-    // 2. Check application emojis cache
-    const app = this.client.application as any;
-    try {
-      if (app?.emojis?.cache) {
-        const found = app.emojis.cache.find((e: any) => e.name === emojiName || e.name === legacyName);
-        if (found) {
-          const formatted = `<:${found.name}:${found.id}>`;
-          this.playerEmojiCache.set(cacheKey, formatted);
-          return formatted;
-        }
-      }
-    } catch {}
-
-    // 3. Check guild emojis cache if available
-    try {
-      if (guild?.emojis?.cache) {
-        const found = guild.emojis.cache.find((e: any) => e.name === emojiName || e.name === legacyName);
-        if (found) {
-          const formatted = `<:${found.name}:${found.id}>`;
-          this.playerEmojiCache.set(cacheKey, formatted);
-          return formatted;
-        }
-      }
-    } catch {}
-
-    // 4. Dynamically upload player head avatar to Discord Application Emojis or Guild
-    try {
-      const avatarUrl = `https://mc-heads.net/avatar/${encodeURIComponent(cleanName)}/32`;
-      const ac = new AbortController();
-      const tm = setTimeout(() => ac.abort(), 2000);
-      const res = await fetch(avatarUrl, { signal: ac.signal });
-      clearTimeout(tm);
-      if (res.ok) {
-        const arrayBuf = await res.arrayBuffer();
-        const buffer = Buffer.from(arrayBuf);
-
-        // Upload as application emoji
-        if (app?.emojis?.create) {
-          try {
-            const newEmoji = await app.emojis.create({
-              attachment: buffer,
-              name: emojiName,
-            });
-            if (newEmoji?.id) {
-              const formatted = `<:${newEmoji.name}:${newEmoji.id}>`;
-              this.playerEmojiCache.set(cacheKey, formatted);
-              return formatted;
-            }
-          } catch (appErr: any) {
-            console.warn('[Apexion Bot] App emoji upload notice:', appErr?.message);
-          }
-        }
-
-        // Upload as guild emoji if application emoji wasn't possible
-        if (guild?.emojis?.create) {
-          try {
-            const newEmoji = await guild.emojis.create({
-              attachment: buffer,
-              name: emojiName,
-            });
-            if (newEmoji?.id) {
-              const formatted = `<:${newEmoji.name}:${newEmoji.id}>`;
-              this.playerEmojiCache.set(cacheKey, formatted);
-              return formatted;
-            }
-          } catch (guildErr: any) {
-            console.warn('[Apexion Bot] Guild emoji upload notice:', guildErr?.message);
-          }
-        }
-      }
-    } catch (err: any) {
-      console.warn(`[Apexion Bot] Could not fetch avatar for ${cleanName}:`, err?.message);
-    }
-
-    return '👤';
+    return this.playerEmojiCache.get(cacheKey) || '👤';
   }
 
   private getPlayerHeadEmoji(playerName: string): string {
@@ -474,12 +457,14 @@ export class DiscordBotService {
       }
     }
 
-    // Fast sync from Aternos: give up to 7000ms if cold/stale/offline so first run always resolves real state
+    const now = Date.now();
     const isCold = !state.lastUpdated || state.lastUpdated === 0;
-    const isStale = Date.now() - (state.lastUpdated || 0) > 4000;
-    if (sessionCookie && (isCold || isStale || state.status === 'offline')) {
+    const isStale = now - (state.lastUpdated || 0) > 25000;
+
+    // Fast sync from Aternos: only when cold or stale, with a 1200ms quick-race
+    if (sessionCookie && (isCold || isStale)) {
       try {
-        const syncTimeout = new Promise<AternosState>(resolve => setTimeout(() => resolve(state), 7000));
+        const syncTimeout = new Promise<AternosState>(resolve => setTimeout(() => resolve(state), 1200));
         const synced = await Promise.race([aternosService.syncSessionState(serverAddress), syncTimeout]);
         if (synced && synced.lastUpdated) {
           state = synced;
@@ -600,14 +585,12 @@ export class DiscordBotService {
       });
     }
 
-    // Online players list with small player head next to each name (no big thumbnail)
+    // Fast synchronous player list rendering (0ms lag, no Discord REST emoji rate limits)
     if (isOnline && playerNames.length > 0) {
-      const playerListItems = await Promise.all(
-        playerNames.map(async n => {
-          const head = await this.ensurePlayerHeadEmoji(n, guild);
-          return `${head} **${n}**`;
-        })
-      );
+      const playerListItems = playerNames.map(n => {
+        const head = this.getPlayerHeadEmoji(n);
+        return `${head} **${n}**`;
+      });
       embed.addFields({
         name: `👤 Connected Players (${playerNames.length})`,
         value: playerListItems.join('  •  '),
@@ -664,13 +647,13 @@ export class DiscordBotService {
     const contextId = channelId || guildId || user.id;
 
     // 1. MUST acknowledge (defer) IMMEDIATELY within milliseconds so Discord NEVER times out!
+    // flags: MessageFlags.Ephemeral ensures the message is private to only the user who typed the command
     try {
       if (!interaction.deferred && !interaction.replied) {
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       }
     } catch (err: any) {
       console.warn(`[Apexion] Could not defer /${commandName}:`, err?.message);
-      return;
     }
 
     // 2. Concurrently clean up the previous response in background (non-blocking)
@@ -827,19 +810,16 @@ export class DiscordBotService {
 
         case 'start': {
           const ctx = this.resolveServerContext(contextId, user.id, guildId);
-          const { state, live } = await this.getFastServerState(ctx.serverAddress, ctx.sessionCookie);
+          const cached = aternosService.getState(ctx.serverAddress);
 
-          const isOnline = !isAternosOfflineIndicator(live?.version, live?.motd) && Boolean(live?.online) && state.status !== 'offline';
-
-          if (isOnline) {
+          if (cached.status === 'online') {
             const embed = new EmbedBuilder()
-              .setColor(0xef4444)
+              .setColor(0x10b981)
               .setTitle(`⚠️ ${ctx.serverAddress} is Already Online!`)
               .setDescription(`Server is already online and joinable.`)
               .addFields(
                 { name: 'Status', value: '🟢 **Online**', inline: true },
-                { name: 'Players', value: `\`${live.players?.online || 0}/${live.players?.max || 20}\``, inline: true },
-                { name: 'Tip', value: 'Use `/stop` to shut down, or `/restart` to reboot.', inline: false }
+                { name: 'Tip', value: 'Use `/status` to view players or `/stop` to shut down.', inline: false }
               )
               .setFooter({ text: 'Apexion' })
               .setTimestamp();
@@ -847,12 +827,12 @@ export class DiscordBotService {
             break;
           }
 
-          if (state.status === 'starting' || state.status === 'queue') {
+          if (cached.status === 'starting' || cached.status === 'queue') {
             const embed = new EmbedBuilder()
               .setColor(0xf59e0b)
               .setTitle(`⏳ ${ctx.serverAddress} is Booting Up!`)
               .setDescription(`Server is already in the starting sequence. Please give it 1 to 2 minutes.`)
-              .addFields({ name: 'Current Status', value: `🟡 ${state.rawStatus || 'Starting ...'}` })
+              .addFields({ name: 'Current Status', value: `🟡 ${cached.rawStatus || 'Starting ...'}` })
               .setFooter({ text: 'Apexion' })
               .setTimestamp();
             await interaction.editReply({ embeds: [embed] });
@@ -900,11 +880,9 @@ export class DiscordBotService {
 
         case 'stop': {
           const ctx = this.resolveServerContext(contextId, user.id, guildId);
-          const { state, live } = await this.getFastServerState(ctx.serverAddress, ctx.sessionCookie);
+          const cached = aternosService.getState(ctx.serverAddress);
 
-          const isOnline = !isAternosOfflineIndicator(live?.version, live?.motd) && (live?.online || state.status === 'online');
-
-          if (!isOnline && state.status !== 'starting' && state.status !== 'stopping') {
+          if (cached.status === 'offline') {
             const embed = new EmbedBuilder()
               .setColor(0xef4444)
               .setTitle(`⚠️ ${ctx.serverAddress} is Already Offline!`)
@@ -915,7 +893,7 @@ export class DiscordBotService {
             break;
           }
 
-          if (state.status === 'stopping') {
+          if (cached.status === 'stopping') {
             const embed = new EmbedBuilder()
               .setColor(0xf59e0b)
               .setTitle(`⏳ ${ctx.serverAddress} is Shutting Down!`)
@@ -1074,12 +1052,10 @@ export class DiscordBotService {
             .setFooter({ text: 'Apexion' })
             .setTimestamp();
 
-          const playerLines = await Promise.all(
-            combinedList.map(async (name, idx) => {
-              const headEmoji = await this.ensurePlayerHeadEmoji(name, interaction.guild);
-              return `**${idx + 1}.** ${headEmoji} **${name}**`;
-            })
-          );
+          const playerLines = combinedList.map((name, idx) => {
+            const headEmoji = this.getPlayerHeadEmoji(name);
+            return `**${idx + 1}.** ${headEmoji} **${name}**`;
+          });
           embed.addFields({ name: 'Player List', value: playerLines.join('\n'), inline: false });
 
           await interaction.editReply({ embeds: [embed] });
