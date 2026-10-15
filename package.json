@@ -10,8 +10,7 @@
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
-    "postinstall": "",
-    "test:start": "tsx test-start.ts"
+    "postinstall": ""
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

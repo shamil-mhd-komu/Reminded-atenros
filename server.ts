@@ -11,9 +11,9 @@ import { CURRENT_ENV, DATA_PREFIX, getRedisHealth } from './src/server/redisClie
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const ADMIN_USERNAME = 'Shifin';
-const ADMIN_PASSWORD = '0508552513';
-const ADMIN_TOKEN = 'shifin-auth-session-key-0508552513';
+const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'Shifin';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '0508552513';
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || 'shifin-auth-session-key-0508552513';
 
 async function startServer() {
   const app = express();

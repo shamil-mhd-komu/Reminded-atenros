@@ -18,13 +18,65 @@ const UPSTASH_TOKEN = cleanEnv(
   'gQAAAAAABFuuAAIgcDE4MDFkODk4NWViZDU0ODllOGNhNDkzNmUyODY3ZWM3Mw'
 );
 
-// In-memory fallback cache in case Redis credentials expire or network fails
+// In-memory fallback cache in case Redis credentials expire, are missing, or network fails
 const inMemoryFallbackStore = new Map<string, { value: any; expiresAt?: number }>();
 
-export const redis = new Redis({
-  url: UPSTASH_URL,
-  token: UPSTASH_TOKEN,
-});
+let upstashClient: Redis | null = null;
+try {
+  if (UPSTASH_URL && UPSTASH_URL.startsWith('https://') && UPSTASH_TOKEN) {
+    upstashClient = new Redis({
+      url: UPSTASH_URL,
+      token: UPSTASH_TOKEN,
+    });
+  }
+} catch (err: any) {
+  console.warn('[Redis] Upstash client init failed, using in-memory mock store:', err?.message);
+}
+
+export const redis = {
+  get: async <T = any>(key: string): Promise<T | null> => {
+    if (upstashClient) {
+      try {
+        return (await upstashClient.get<T>(key)) as T | null;
+      } catch {}
+    }
+    const cached = inMemoryFallbackStore.get(key);
+    if (!cached) return null;
+    if (cached.expiresAt && cached.expiresAt < Date.now()) {
+      inMemoryFallbackStore.delete(key);
+      return null;
+    }
+    return cached.value as T;
+  },
+  set: async (key: string, value: any, opts?: { ex?: number }): Promise<'OK' | null> => {
+    const expiresAt = opts?.ex ? Date.now() + opts.ex * 1000 : undefined;
+    inMemoryFallbackStore.set(key, { value, expiresAt });
+    if (upstashClient) {
+      try {
+        if (opts?.ex) {
+          return (await upstashClient.set(key, value, { ex: opts.ex })) as 'OK' | null;
+        }
+        return (await upstashClient.set(key, value)) as 'OK' | null;
+      } catch {}
+    }
+    return 'OK';
+  },
+  del: async (key: string): Promise<number> => {
+    const deleted = inMemoryFallbackStore.delete(key) ? 1 : 0;
+    if (upstashClient) {
+      try {
+        return await upstashClient.del(key);
+      } catch {}
+    }
+    return deleted;
+  },
+  ping: async (): Promise<string> => {
+    if (upstashClient) {
+      return await upstashClient.ping();
+    }
+    return 'PONG';
+  },
+};
 
 /**
  * Determine if current instance is 'published' (production) or 'dev' (preview)
