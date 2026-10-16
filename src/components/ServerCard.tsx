@@ -53,7 +53,7 @@ export const ServerCard: React.FC<ServerCardProps> = ({
       case 'loading':
         return {
           pillBg: 'bg-amber-500/15 text-amber-300 border-amber-500/30',
-          dotBg: 'bg-amber-400 animate-ping',
+          dotBg: 'bg-amber-400 animate-pulse',
           label: (state.rawStatus || 'BOOTING...').toUpperCase(),
           isLive: false,
           glow: 'from-amber-500/10 via-amber-500/5 to-transparent',
@@ -92,7 +92,7 @@ export const ServerCard: React.FC<ServerCardProps> = ({
       initial={{ opacity: 0, y: 12 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.35, ease: 'easeOut' }}
-      className="relative overflow-hidden rounded-3xl bg-zinc-900/70 border border-white/[0.08] shadow-2xl backdrop-blur-2xl p-6 sm:p-8"
+      className="relative overflow-hidden rounded-3xl bg-zinc-900 border border-white/10 shadow-2xl p-6 sm:p-8 isolate"
     >
       {/* Dynamic ambient backdrop glow */}
       <div
@@ -129,15 +129,21 @@ export const ServerCard: React.FC<ServerCardProps> = ({
 
           {/* Metadata chips */}
           <div className="flex flex-wrap items-center gap-2 text-xs font-mono text-zinc-400">
-            <span className="px-2.5 py-1 rounded-full bg-zinc-950/60 border border-white/[0.06] text-zinc-300">
-              {state.software || 'Paper / Bukkit'}
-            </span>
-            <span className="px-2.5 py-1 rounded-full bg-zinc-950/60 border border-white/[0.06] text-zinc-300">
-              v{state.version || '1.20.4'}
-            </span>
-            <span className="px-2.5 py-1 rounded-full bg-zinc-950/60 border border-white/[0.06] text-zinc-300">
-              Port {state.serverPort || '25565'}
-            </span>
+            {state.software && (
+              <span className="px-2.5 py-1 rounded-full bg-zinc-950/60 border border-white/[0.06] text-zinc-300 font-medium">
+                {state.software}
+              </span>
+            )}
+            {state.version && (
+              <span className="px-2.5 py-1 rounded-full bg-zinc-950/60 border border-white/[0.06] text-zinc-300">
+                v{state.version}
+              </span>
+            )}
+            {state.serverPort && (
+              <span className="px-2.5 py-1 rounded-full bg-zinc-950/60 border border-white/[0.06] text-zinc-300">
+                Port {state.serverPort}
+              </span>
+            )}
             {state.playersOnline !== undefined && (
               <span className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 font-semibold">
                 <Users className="w-3 h-3" />

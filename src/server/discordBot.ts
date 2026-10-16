@@ -19,8 +19,13 @@ import { serverStorage } from './serverStorage.ts';
 import { queryMinecraftServer, isAternosOfflineIndicator } from './mcPing.ts';
 import { CURRENT_ENV, GLOBAL_KEYS, redis, getRedisJson, setRedisJson } from './redisClient.ts';
 
-const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN || 'MTU1NTMzMDg1Njc1Nzc1NTk5NA.GLEqGe.jXMPh6b0PV8HEOB0sKBRbGTkOTBxgGmiX3tSOQ';
-const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID || '1555330856757755994';
+function getBotToken(): string {
+  return serverStorage.getBotToken() || process.env.DISCORD_BOT_TOKEN || '';
+}
+
+function getBotClientId(): string {
+  return serverStorage.getBotClientId() || process.env.DISCORD_CLIENT_ID || '1555330856757755994';
+}
 
 interface DiscoveredServer {
   id: string;
@@ -80,7 +85,7 @@ export class DiscordBotService {
     this.client.once('ready', async () => {
       this.isReady = true;
       this.botTag = this.client.user?.tag || 'Apexion Bot';
-      this.botId = this.client.user?.id || DISCORD_CLIENT_ID;
+      this.botId = this.client.user?.id || getBotClientId();
       this.lastPing = this.client.ws.ping;
       console.log(`[Apexion Discord Bot (${CURRENT_ENV.toUpperCase()})] Connected as ${this.botTag} (${this.botId})`);
 
@@ -146,36 +151,27 @@ export class DiscordBotService {
   private startWatchdog() {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
 
-    // In dev environment, never poll or attempt to connect unless explicitly targeted as 'dev'
-    if (CURRENT_ENV === 'dev') {
-      const activeTarget = serverStorage.getBotTarget();
-      if (activeTarget !== 'dev') {
-        console.log(`[Apexion Bot] Preview environment: Discord bot is dormant & OFF.`);
-        return;
-      }
-    }
-
     this.heartbeatTimer = setInterval(async () => {
       try {
         const globalTarget = await getRedisJson<string>(GLOBAL_KEYS.BOT_MODE, 'published');
-        const isPublishedInstance = CURRENT_ENV === 'published';
-        const isDevInstance = CURRENT_ENV === 'dev';
-
-        // In dev, if target is not 'dev', disconnect immediately and stay off
-        if (isDevInstance && globalTarget !== 'dev') {
+        if (globalTarget === 'disabled') {
           if (this.isReady || this.client.isReady()) {
-            console.log(`[Apexion Bot Watchdog] Disconnecting dev preview bot to allow published bot uninterrupted control.`);
+            console.log(`[Apexion Bot Watchdog] Bot is explicitly disabled by admin. Standing down.`);
             await this.stop().catch(() => {});
           }
           return;
         }
 
-        // Published instance stays active 24/7 unless explicitly disabled
-        const shouldRunHere = globalTarget !== 'disabled' && (
-          (isPublishedInstance && globalTarget !== 'dev') ||
-          (isDevInstance && globalTarget === 'dev') ||
-          (!isPublishedInstance && !isDevInstance)
-        );
+        const isPublishedInstance = CURRENT_ENV === 'published';
+        const isDevInstance = CURRENT_ENV === 'dev';
+
+        // Check if there is an active published leader heartbeat in Redis (within last 75s)
+        const activeLeader = await getRedisJson<{ env: string; heartbeat: number } | null>(GLOBAL_KEYS.BOT_LEADER, null);
+        const now = Date.now();
+        const isPublishedActive = activeLeader && activeLeader.env === 'published' && (now - activeLeader.heartbeat < 75000);
+
+        // Published always runs; dev runs if target is 'dev' OR if no published instance is actively leading
+        const shouldRunHere = isPublishedInstance || globalTarget === 'dev' || !isPublishedActive;
 
         if (shouldRunHere) {
           const wsStatus = this.client.ws?.status; // 0 = READY in discord.js
@@ -187,30 +183,23 @@ export class DiscordBotService {
           await setRedisJson(GLOBAL_KEYS.BOT_LEADER, { env: CURRENT_ENV, heartbeat: Date.now() }, 90);
         } else {
           if (this.isReady || this.client.isReady()) {
-            console.log(`[Apexion Bot Watchdog] Standing down ${CURRENT_ENV} as target is "${globalTarget}".`);
+            console.log(`[Apexion Bot Watchdog] Standing down ${CURRENT_ENV} as active published leader is operational.`);
             await this.stop().catch(() => {});
           }
         }
       } catch {}
-    }, 45000);
+    }, 30000);
   }
 
   private scheduleReconnect() {
     if (this.reconnectTimer) return;
 
-    // Never auto-reconnect on dev if target is published
-    if (CURRENT_ENV === 'dev') {
-      const activeTarget = serverStorage.getBotTarget();
-      if (activeTarget !== 'dev') return;
-    }
-
     this.reconnectTimer = setTimeout(async () => {
       this.reconnectTimer = null;
-      if (!DISCORD_BOT_TOKEN) return;
+      if (!getBotToken()) return;
 
       const activeTarget = serverStorage.getBotTarget();
       if (activeTarget === 'disabled') return;
-      if (CURRENT_ENV === 'dev' && activeTarget !== 'dev') return;
 
       this.isExplicitlyStopped = false;
       console.log(`[Apexion Bot (${CURRENT_ENV})] Reconnecting gateway...`);
@@ -226,18 +215,9 @@ export class DiscordBotService {
       return;
     }
 
-    // In dev/preview, keep bot turned off unless admin explicitly selected 'dev' target
-    if (CURRENT_ENV === 'dev' && activeTarget !== 'dev') {
-      console.log(`[Apexion Bot] Preview dev environment: bot is TURNED OFF to prevent clashing with published bot.`);
-      this.isExplicitlyStopped = true;
-      if (this.isReady || this.client.isReady()) {
-        await this.stop().catch(() => {});
-      }
-      return;
-    }
-
-    if (!DISCORD_BOT_TOKEN) {
-      console.warn('[Apexion Bot] No token provided.');
+    const token = getBotToken();
+    if (!token) {
+      console.warn('[Apexion Bot] No token provided. Configure your Discord bot token in the Admin Panel.');
       return;
     }
 
@@ -249,7 +229,7 @@ export class DiscordBotService {
       this.isExplicitlyStopped = false;
       this.initError = null;
       console.log(`[Apexion Bot (${CURRENT_ENV})] Connecting to Discord Gateway...`);
-      await this.client.login(DISCORD_BOT_TOKEN);
+      await this.client.login(token);
     } catch (err: any) {
       this.initError = err.message;
       console.error(`[Apexion Bot (${CURRENT_ENV})] Login failed:`, err?.message);
@@ -281,6 +261,81 @@ export class DiscordBotService {
       });
     } catch (err: any) {
       console.warn('[Apexion Bot] Error during stop:', err?.message);
+    }
+  }
+
+  public async updateCredentials(token: string, clientId?: string): Promise<{ success: boolean; message: string; botTag?: string }> {
+    const cleanToken = (token || '').trim();
+    if (!cleanToken) {
+      return { success: false, message: 'Bot token cannot be empty.' };
+    }
+
+    let cleanClientId = (clientId || '').trim();
+    if (!cleanClientId && cleanToken.includes('.')) {
+      try {
+        const firstPart = cleanToken.split('.')[0];
+        const decoded = Buffer.from(firstPart, 'base64').toString('ascii');
+        if (/^\d{17,20}$/.test(decoded)) {
+          cleanClientId = decoded;
+        }
+      } catch {}
+    }
+
+    await serverStorage.setBotCredentials(cleanToken, cleanClientId);
+
+    try {
+      this.isExplicitlyStopped = false;
+      if (this.reconnectTimer) {
+        clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = null;
+      }
+
+      try {
+        this.client.destroy();
+      } catch {}
+
+      this.client = new Client({
+        intents: [GatewayIntentBits.Guilds],
+        ws: { large_threshold: 50 },
+        rest: { timeout: 15000, retries: 3 },
+      });
+
+      this.setupEventHandlers();
+      this.isReady = false;
+      this.initError = null;
+
+      console.log(`[Apexion Bot] Authenticating with updated Discord bot token...`);
+      await this.client.login(cleanToken);
+
+      // Wait briefly up to 4s for ready event
+      let waited = 0;
+      while (!this.isReady && waited < 4000) {
+        await new Promise(r => setTimeout(r, 200));
+        waited += 200;
+      }
+
+      return {
+        success: true,
+        message: `Discord bot connected successfully as ${this.botTag || 'Apexion Bot'}.`,
+        botTag: this.botTag,
+      };
+    } catch (err: any) {
+      this.initError = err?.message || 'Login failed';
+      return {
+        success: false,
+        message: `Failed to connect with token: ${err?.message || 'Invalid bot token'}`,
+      };
+    }
+  }
+
+  public async forceRestart(): Promise<{ success: boolean; message: string }> {
+    try {
+      await this.stop();
+      this.isExplicitlyStopped = false;
+      await this.start();
+      return { success: true, message: 'Discord bot rebooted successfully.' };
+    } catch (err: any) {
+      return { success: false, message: err?.message || 'Failed to restart bot.' };
     }
   }
 
@@ -326,7 +381,8 @@ export class DiscordBotService {
       new SlashCommandBuilder()
         .setName('configure')
         .setDescription('Link your Aternos server with your session cookie')
-        .addStringOption(o => o.setName('session').setDescription('Aternos session cookie').setRequired(true)),
+        .addStringOption(o => o.setName('session').setDescription('Aternos session cookie').setRequired(true))
+        .addStringOption(o => o.setName('server').setDescription('Optional server name/IP to link directly (e.g. myserver.aternos.me)').setRequired(false)),
 
       new SlashCommandBuilder()
         .setName('start')
@@ -350,8 +406,13 @@ export class DiscordBotService {
     ];
 
     try {
-      const rest = new REST({ version: '10' }).setToken(DISCORD_BOT_TOKEN);
-      const targetId = this.botId || DISCORD_CLIENT_ID;
+      const token = getBotToken();
+      if (!token) {
+        console.warn('[Apexion Bot] Slash commands registration skipped: no bot token configured.');
+        return;
+      }
+      const rest = new REST({ version: '10' }).setToken(token);
+      const targetId = this.botId || getBotClientId();
 
       // Register single set of global commands
       await rest.put(Routes.applicationCommands(targetId), {
@@ -390,10 +451,11 @@ export class DiscordBotService {
 
     if (binding) {
       const canonical = serverStorage.getCanonicalServerAddress(binding.serverAddress);
+      const serverCookie = binding.serverCookie || serverStorage.getServerCookie(canonical) || '';
       return {
         serverAddress: canonical,
         sessionCookie: binding.sessionCookie,
-        serverCookie: binding.serverCookie,
+        serverCookie,
         binding,
       };
     }
@@ -411,19 +473,7 @@ export class DiscordBotService {
       };
     }
 
-    // 5. Fallback to first available profile in server storage
-    const allProfiles = serverStorage.getAllProfiles();
-    if (allProfiles.length > 0) {
-      const p = allProfiles[0];
-      const canonical = serverStorage.getCanonicalServerAddress(p.serverIp || p.name);
-      return {
-        serverAddress: canonical,
-        sessionCookie: p.sessionCookie,
-        serverCookie: p.serverCookie,
-        profile: p,
-      };
-    }
-
+    // Never fall back to random arbitrary profiles that don't belong to this context
     return {
       serverAddress: '',
       sessionCookie: '',
@@ -446,14 +496,18 @@ export class DiscordBotService {
   }
 
   // Fast resolution of fresh Aternos + Minecraft live status
-  private async getFastServerState(serverAddress: string, sessionCookie?: string) {
+  private async getFastServerState(serverAddress: string, sessionCookie?: string, serverCookie?: string) {
     let state: AternosState = aternosService.getState(serverAddress);
 
     // Retrieve saved credentials if not passed directly
-    if (!sessionCookie) {
-      const p = serverStorage.getProfile(serverAddress) || serverStorage.getProfile(serverStorage.getCanonicalServerAddress(serverAddress));
-      if (p?.sessionCookie) {
+    if (!sessionCookie || !serverCookie) {
+      const canonical = serverStorage.getCanonicalServerAddress(serverAddress);
+      const p = serverStorage.getProfile(canonical) || serverStorage.getProfile(serverAddress);
+      if (!sessionCookie && p?.sessionCookie) {
         sessionCookie = p.sessionCookie;
+      }
+      if (!serverCookie) {
+        serverCookie = p?.serverCookie || serverStorage.getServerCookie(canonical) || serverStorage.getServerCookie(serverAddress);
       }
     }
 
@@ -461,11 +515,14 @@ export class DiscordBotService {
     const isCold = !state.lastUpdated || state.lastUpdated === 0;
     const isStale = now - (state.lastUpdated || 0) > 25000;
 
-    // Fast sync from Aternos: only when cold or stale, with a 1200ms quick-race
+    // Fast sync from Aternos: only when cold or stale, with a 1400ms quick-race
     if (sessionCookie && (isCold || isStale)) {
       try {
-        const syncTimeout = new Promise<AternosState>(resolve => setTimeout(() => resolve(state), 1200));
-        const synced = await Promise.race([aternosService.syncSessionState(serverAddress), syncTimeout]);
+        const syncTimeout = new Promise<AternosState>(resolve => setTimeout(() => resolve(state), 1400));
+        const synced = await Promise.race([
+          aternosService.syncSessionState(serverAddress, { sessionCookie, serverCookie, serverAddress }),
+          syncTimeout,
+        ]);
         if (synced && synced.lastUpdated) {
           state = synced;
         }
@@ -767,26 +824,31 @@ export class DiscordBotService {
           }
 
           const menuCustomId = `select_srv_${user.id}_${Date.now()}`;
-          this.pendingSelections.set(menuCustomId, {
+          const pendingData: PendingSession = {
             session,
             servers: discovered,
             contextId,
             guildId: guildId || undefined,
             userId: user.id,
             userName: user.username,
-          });
+          };
+          this.pendingSelections.set(menuCustomId, pendingData);
+          serverStorage.setPendingSelection(menuCustomId, pendingData, 86400);
+          serverStorage.setPendingSelection(`user_${user.id}`, pendingData, 86400);
+          serverStorage.saveUserSession(user.id, session);
 
           const selectMenu = new StringSelectMenuBuilder()
             .setCustomId(menuCustomId)
             .setPlaceholder('Choose a server to link...')
             .addOptions(
-              discovered.map(s =>
-                new StringSelectMenuOptionBuilder()
-                  .setLabel(s.serverAddress)
-                  .setDescription(`Server ID: ${s.id}`)
-                  .setValue(s.id)
-                  .setEmoji('🎮')
-              )
+              discovered.map(s => {
+                const encodedVal = `${s.id}:::${s.serverAddress}:::${s.serverCookie || s.id}`;
+                return new StringSelectMenuOptionBuilder()
+                  .setLabel(s.serverAddress.slice(0, 100))
+                  .setDescription(`Server ID: ${s.id}`.slice(0, 100))
+                  .setValue(encodedVal)
+                  .setEmoji('🎮');
+              })
             );
 
           const actionRow = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(selectMenu);
@@ -1089,64 +1151,85 @@ export class DiscordBotService {
     }
 
     const { customId, values, user } = interaction;
-    const pending = this.pendingSelections.get(customId);
+    const rawVal = values[0] || '';
+    let chosenId = rawVal;
+    let chosenAddress = '';
+    let chosenCookie = '';
 
-    if (!pending) {
-      await interaction.followUp({
-        content: '⚠️ This server selection menu has expired. Please run `/configure` again.',
-        ephemeral: true,
-      }).catch(() => {});
-      return;
+    if (rawVal.includes(':::')) {
+      const parts = rawVal.split(':::');
+      chosenId = parts[0];
+      chosenAddress = parts[1] || '';
+      chosenCookie = parts[2] || '';
     }
 
-    const selectedId = values[0];
-    const chosenServer = pending.servers.find(s => s.id === selectedId);
+    // Multi-tier recovery: check in-memory -> persistent pending selection -> user pending selection
+    let pending: PendingSession | undefined =
+      this.pendingSelections.get(customId) ||
+      (await serverStorage.getPendingSelection(customId)) ||
+      (await serverStorage.getPendingSelection(`user_${user.id}`));
 
-    if (!chosenServer) {
+    const fallbackSession = await serverStorage.getUserSession(user.id);
+    const sessionToUse = pending?.session || fallbackSession;
+
+    let chosenServer = pending?.servers?.find(s => s.id === chosenId || s.serverAddress === chosenAddress);
+    if (!chosenServer && chosenAddress) {
+      chosenServer = {
+        id: chosenId,
+        name: chosenAddress,
+        serverAddress: chosenAddress,
+        serverCookie: chosenCookie || chosenId,
+      };
+    }
+
+    if (!chosenServer || !sessionToUse) {
       await interaction.followUp({
-        content: '⚠️ Selected server was not found.',
+        content: '⚠️ Selection could not be restored. Please run `/configure` with your session again.',
         ephemeral: true,
       }).catch(() => {});
       return;
     }
 
     try {
-      const canonicalAddr = serverStorage.getCanonicalServerAddress(chosenServer.serverAddress);
+      const canonicalAddr = serverStorage.getCanonicalServerAddress(chosenAddress || chosenServer.serverAddress);
+      const serverCookie = chosenCookie || chosenServer.serverCookie || chosenServer.id;
+      const effectiveContext = pending?.contextId || interaction.channelId || user.id;
+      const effectiveGuild = pending?.guildId || interaction.guildId;
 
       serverStorage.setDiscordBinding({
-        guildIdOrUserId: pending.contextId,
+        guildIdOrUserId: effectiveContext,
         serverAddress: canonicalAddr,
-        sessionCookie: pending.session,
-        serverCookie: chosenServer.serverCookie,
-        configuredBy: pending.userName,
+        sessionCookie: sessionToUse,
+        serverCookie,
+        configuredBy: pending?.userName || user.username,
         updatedAt: Date.now(),
       });
 
-      if (pending.guildId && pending.guildId !== pending.contextId) {
+      if (effectiveGuild && effectiveGuild !== effectiveContext) {
         serverStorage.setDiscordBinding({
-          guildIdOrUserId: pending.guildId,
+          guildIdOrUserId: effectiveGuild,
           serverAddress: canonicalAddr,
-          sessionCookie: pending.session,
-          serverCookie: chosenServer.serverCookie,
-          configuredBy: pending.userName,
+          sessionCookie: sessionToUse,
+          serverCookie,
+          configuredBy: pending?.userName || user.username,
           updatedAt: Date.now(),
         });
       }
 
-      if (pending.userId !== pending.contextId) {
+      if (user.id !== effectiveContext) {
         serverStorage.setDiscordBinding({
-          guildIdOrUserId: pending.userId,
+          guildIdOrUserId: user.id,
           serverAddress: canonicalAddr,
-          sessionCookie: pending.session,
-          serverCookie: chosenServer.serverCookie,
-          configuredBy: pending.userName,
+          sessionCookie: sessionToUse,
+          serverCookie,
+          configuredBy: pending?.userName || user.username,
           updatedAt: Date.now(),
         });
       }
 
       await aternosService.updateConfig({
-        sessionCookie: pending.session,
-        serverCookie: chosenServer.serverCookie,
+        sessionCookie: sessionToUse,
+        serverCookie,
         serverAddress: canonicalAddr,
       });
 
@@ -1176,18 +1259,30 @@ export class DiscordBotService {
 
       await interaction.editReply({ embeds: [embed], components: [] });
       this.pendingSelections.delete(customId);
+      serverStorage.deletePendingSelection(customId);
+      serverStorage.deletePendingSelection(`user_${user.id}`);
     } catch (err: any) {
       console.error('[Apexion Select Menu Error]', err);
     }
   }
 
   public getBotStatus() {
+    const token = getBotToken();
+    const maskedToken = token
+      ? token.length > 10
+        ? `${token.slice(0, 4)}••••••••${token.slice(-4)}`
+        : '••••••••'
+      : '';
+
     return {
       isReady: this.isReady,
+      configured: Boolean(token && token.trim().length > 10),
+      maskedToken,
+      clientId: getBotClientId(),
       currentEnv: CURRENT_ENV,
       activeTarget: serverStorage.getBotTarget(),
-      botTag: this.botTag || (this.isReady ? 'Apexion#3859' : 'Standby / Disconnected'),
-      botId: this.botId,
+      botTag: this.botTag || (this.isReady ? 'Apexion Bot' : 'Standby / Disconnected'),
+      botId: this.botId || getBotClientId(),
       guildsCount: this.client.guilds?.cache?.size || 0,
       ping: this.client.ws?.ping || this.lastPing || 0,
       initError: this.initError,

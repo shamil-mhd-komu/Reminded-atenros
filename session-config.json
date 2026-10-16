@@ -1,8 +1,5 @@
 {
   "sessionCookie": "",
   "serverCookie": "",
-  "serverAddress": "",
-  "software": "Paper / Bukkit",
-  "version": "1.20.4",
-  "serverPort": "25565"
+  "serverAddress": ""
 }

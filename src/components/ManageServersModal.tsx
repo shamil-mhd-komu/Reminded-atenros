@@ -1,5 +1,20 @@
-import React, { useState } from 'react';
-import { X, Server, Plus, Trash2, Edit2, Loader2, Check, Sparkles } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import {
+  X,
+  Server,
+  Plus,
+  Trash2,
+  Edit2,
+  Loader2,
+  Check,
+  Sparkles,
+  Users,
+  Wifi,
+  Globe,
+  Key,
+  ArrowRight,
+  ShieldAlert,
+} from 'lucide-react';
 import type { ServerProfile, AternosState } from '../types/aternos.ts';
 
 interface ManageServersModalProps {
@@ -43,7 +58,7 @@ export const ManageServersModal: React.FC<ManageServersModalProps> = ({
   const [displayName, setDisplayName] = useState('');
   const [serverAddress, setServerAddress] = useState('');
   const [serverPort, setServerPort] = useState('25565');
-  const [software, setSoftware] = useState('Paper / Bukkit');
+  const [software, setSoftware] = useState('Fabric');
   const [version, setVersion] = useState('1.20.4');
   const [sessionCookie, setSessionCookie] = useState('');
   const [serverCookie, setServerCookie] = useState('');
@@ -56,7 +71,7 @@ export const ManageServersModal: React.FC<ManageServersModalProps> = ({
     Array<{ id: string; name: string; serverAddress: string; serverCookie: string }>
   >([]);
 
-  React.useEffect(() => {
+  useEffect(() => {
     if (isOpen && servers.length === 0 && !isAddingNew && !editingId) {
       setIsAddingNew(true);
       setDisplayName('My Aternos Server');
@@ -64,18 +79,25 @@ export const ManageServersModal: React.FC<ManageServersModalProps> = ({
       setSessionCookie('');
       setServerCookie('');
     }
-  }, [isOpen, servers.length]);
+  }, [isOpen, servers.length, isAddingNew, editingId]);
 
   if (!isOpen) return null;
 
   const startEdit = (server: ServerProfile) => {
+    const key = (server.serverIp || server.name || server.id).toLowerCase();
+    const live = serverStates[server.id] || serverStates[key];
+
+    const effPort = live?.serverPort || server.serverPort || '25565';
+    const effSoftware = live?.software || server.software || 'Paper / Bukkit';
+    const effVersion = live?.version || server.version || '1.20.4';
+
     setEditingId(server.id);
     setIsAddingNew(false);
     setDisplayName(server.name || server.serverIp || '');
     setServerAddress(server.serverIp || server.name || '');
-    setServerPort(server.serverPort || '25565');
-    setSoftware(server.software || 'Paper / Bukkit');
-    setVersion(server.version || '1.20.4');
+    setServerPort(effPort);
+    setSoftware(effSoftware);
+    setVersion(effVersion);
     setSessionCookie(server.sessionCookie || '');
     setServerCookie(server.serverCookie || '');
     setCfClearanceCookie(server.cfClearanceCookie || '');
@@ -90,7 +112,7 @@ export const ManageServersModal: React.FC<ManageServersModalProps> = ({
     setDisplayName('');
     setServerAddress('');
     setServerPort('25565');
-    setSoftware('Paper / Bukkit');
+    setSoftware('Fabric');
     setVersion('1.20.4');
     setSessionCookie('');
     setServerCookie('');
@@ -106,10 +128,18 @@ export const ManageServersModal: React.FC<ManageServersModalProps> = ({
 
     // If session cookie is empty in form, look up from existing profiles
     if (!cleanSession) {
-      const existingWithSession = servers.find(s => s.sessionCookie && s.sessionCookie.trim().length > 10 && !s.sessionCookie.includes('...'));
+      const existingWithSession = servers.find(
+        s => s.sessionCookie && s.sessionCookie.trim().length > 10 && !s.sessionCookie.includes('...')
+      );
       if (existingWithSession) {
         cleanSession = existingWithSession.sessionCookie.trim();
+        setSessionCookie(cleanSession);
       }
+    }
+
+    if (!cleanSession) {
+      setDetectError('Please paste your ATERNOS_SESSION cookie first.');
+      return;
     }
 
     setIsDetecting(true);
@@ -128,14 +158,16 @@ export const ManageServersModal: React.FC<ManageServersModalProps> = ({
         const detectedAddr = data.serverAddress || data.displayName;
         if (detectedAddr) {
           setServerAddress(detectedAddr);
-          setDisplayName(detectedAddr);
+          if (!displayName || displayName === 'My Aternos Server' || displayName === serverAddress) {
+            setDisplayName(detectedAddr);
+          }
         }
         if (data.serverCookie) {
           setServerCookie(data.serverCookie);
         }
         if (data.software) setSoftware(data.software);
         if (data.version) setVersion(data.version);
-        if (data.serverPort) setServerPort(data.serverPort);
+        if (data.serverPort) setServerPort(String(data.serverPort));
         if (data.allServers && Array.isArray(data.allServers) && data.allServers.length > 0) {
           setDiscoveredServers(data.allServers);
         }
@@ -152,8 +184,8 @@ export const ManageServersModal: React.FC<ManageServersModalProps> = ({
     }
   };
 
-  const handleSessionChange = (val: string) => {
-    setSessionCookie(val);
+  const handleSessionChange = (rawVal: string) => {
+    let val = rawVal;
     setDetectError(null);
 
     // If user pasted a full cookie header with ATERNOS_SERVER
@@ -167,18 +199,18 @@ export const ManageServersModal: React.FC<ManageServersModalProps> = ({
     const sessionMatch = val.match(/ATERNOS_SESSION=([^;\s]+)/i);
     if (sessionMatch) {
       val = sessionMatch[1].trim();
-      setSessionCookie(val);
     }
+    setSessionCookie(val);
 
     // If user pasted text containing an aternos address
-    const addressMatch = val.match(/([a-zA-Z0-9_\-]+)\.aternos\.me/i);
+    const addressMatch = rawVal.match(/([a-zA-Z0-9_\-]+)\.aternos\.me/i);
     if (addressMatch) {
       const domain = `${addressMatch[1]}.aternos.me`;
       setServerAddress(domain);
-      setDisplayName(domain); // Take server address and put it as Display name
+      setDisplayName(domain);
     }
 
-    if (val.trim().length >= 10 || currentServerCookie) {
+    if (val.trim().length >= 10) {
       handleAutoDetect(val, currentServerCookie);
     }
   };
@@ -187,7 +219,6 @@ export const ManageServersModal: React.FC<ManageServersModalProps> = ({
     setServerCookie(val);
     setDetectError(null);
 
-    // If user pasted full cookie header into serverCookie field
     const sessionMatch = val.match(/ATERNOS_SESSION=([^;\s]+)/i);
     let curSession = sessionCookie;
     if (sessionMatch) {
@@ -199,13 +230,6 @@ export const ManageServersModal: React.FC<ManageServersModalProps> = ({
     if (serverMatch) {
       val = serverMatch[1].trim();
       setServerCookie(val);
-    }
-
-    const addressMatch = val.match(/([a-zA-Z0-9_\-]+)\.aternos\.me/i);
-    if (addressMatch) {
-      const domain = `${addressMatch[1]}.aternos.me`;
-      setServerAddress(domain);
-      setDisplayName(domain); // Take server address and put it as Display name
     }
 
     if (val.trim().length >= 4) {
@@ -256,177 +280,200 @@ export const ManageServersModal: React.FC<ManageServersModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/85 backdrop-blur-sm animate-in fade-in duration-200">
-      <div className="relative w-full max-w-2xl rounded-2xl bg-zinc-900 border border-zinc-700 shadow-2xl p-6 overflow-hidden flex flex-col max-h-[90vh]">
-        {/* Header */}
-        <div className="flex items-center justify-between pb-4 border-b border-zinc-800 shrink-0">
-          <div className="flex items-center gap-2.5">
-            <div className="w-8 h-8 rounded-lg bg-zinc-800 border border-zinc-700 flex items-center justify-center">
-              <Server className="w-4 h-4 text-white" />
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-2 sm:p-4 bg-black/85">
+      <div className="relative w-full max-w-2xl rounded-2xl sm:rounded-3xl bg-zinc-900 border border-zinc-700 shadow-2xl overflow-hidden flex flex-col max-h-[92vh] sm:max-h-[88vh] transform-gpu">
+        
+        {/* Sticky Header - Solid background without backdrop-blur to prevent Chrome scroll tearing */}
+        <div className="px-4 py-3.5 sm:px-6 sm:py-4 border-b border-zinc-800 shrink-0 bg-zinc-900 flex items-center justify-between z-10">
+          <div className="flex items-center gap-2.5 sm:gap-3 min-w-0">
+            <div className="w-9 h-9 sm:w-10 sm:h-10 rounded-xl bg-zinc-800 border border-zinc-700 flex items-center justify-center shrink-0 shadow-inner">
+              <Server className="w-4 h-4 sm:w-5 sm:h-5 text-white" />
             </div>
-            <div>
-              <h3 className="text-base font-bold text-white tracking-tight uppercase font-mono">
+            <div className="min-w-0">
+              <h3 className="text-sm sm:text-base font-bold text-white tracking-tight uppercase font-mono truncate">
                 Server Profiles
               </h3>
-              <p className="text-xs text-zinc-400">
-                Switch and control multiple Minecraft servers with independent credentials
+              <p className="text-[11px] sm:text-xs text-zinc-400 truncate">
+                Real-time 1:1 sync with Aternos dashboard
               </p>
             </div>
           </div>
           <button
             onClick={onClose}
-            className="p-1.5 rounded-lg text-zinc-400 hover:text-white hover:bg-zinc-800 transition-colors cursor-pointer"
+            aria-label="Close"
+            className="p-2 -mr-1 rounded-xl text-zinc-400 hover:text-white hover:bg-zinc-800 transition-colors cursor-pointer shrink-0"
           >
             <X className="w-5 h-5" />
           </button>
         </div>
 
-        {/* Content body */}
-        <div className="flex-1 overflow-y-auto py-4 space-y-4">
-          {/* Action row */}
+        {/* Content Body - min-h-0 and isolate prevent Chrome scroll cutting & height miscalculations */}
+        <div className="flex-1 min-h-0 overflow-y-auto p-3.5 sm:p-6 space-y-4 overscroll-contain transform-gpu isolate">
+          
+          {/* Action Row when viewing list */}
           {!isAddingNew && !editingId && (
             <div className="flex items-center justify-between pb-1">
-              <span className="text-xs font-mono text-zinc-400">
-                {servers.length} {servers.length === 1 ? 'Server' : 'Servers'}
+              <span className="text-xs font-mono font-medium text-zinc-400">
+                {servers.length} {servers.length === 1 ? 'Registered Server' : 'Registered Servers'}
               </span>
               <button
                 onClick={startCreate}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-mono font-bold text-black bg-white hover:bg-zinc-200 transition-colors cursor-pointer shadow-sm"
+                className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-mono font-bold text-black bg-white hover:bg-zinc-200 transition-all cursor-pointer shadow-md active:scale-95"
               >
-                <Plus className="w-3.5 h-3.5" />
+                <Plus className="w-4 h-4" />
                 <span>Add Server</span>
               </button>
             </div>
           )}
 
-          {/* Form (Add or Edit) */}
+          {/* Form: Add or Edit */}
           {(isAddingNew || editingId) ? (
-            <form onSubmit={handleSaveForm} className="bg-zinc-950 border border-zinc-800 rounded-xl p-4 space-y-4">
-              <div className="flex items-center justify-between pb-2 border-b border-zinc-850">
-                <span className="text-xs font-mono font-bold text-white">
-                  {isAddingNew ? 'Create New Server' : 'Edit Server'}
-                </span>
+            <form onSubmit={handleSaveForm} className="space-y-4">
+              <div className="flex items-center justify-between pb-2 border-b border-zinc-800">
+                <div className="flex items-center gap-2">
+                  <div className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                  <span className="text-xs sm:text-sm font-mono font-bold text-white uppercase tracking-wide">
+                    {isAddingNew ? 'Create Server Profile' : 'Edit Server Profile'}
+                  </span>
+                </div>
                 <button
                   type="button"
                   onClick={() => {
                     setIsAddingNew(false);
                     setEditingId(null);
                   }}
-                  className="text-xs text-zinc-400 hover:text-white font-mono cursor-pointer"
+                  className="px-2.5 py-1 text-xs text-zinc-400 hover:text-white font-mono rounded-lg hover:bg-zinc-800 transition-colors cursor-pointer"
                 >
                   Cancel
                 </button>
               </div>
 
-              {/* Display Name Field */}
-              <div>
-                <div className="flex items-center justify-between mb-1.5">
-                  <label className="block text-xs font-mono font-bold text-zinc-200">
-                    Display Name
-                  </label>
-                  {isDetecting ? (
-                    <span className="text-[11px] font-mono text-zinc-400 flex items-center gap-1">
-                      <Loader2 className="w-3 h-3 animate-spin" /> Auto-fetching from Aternos...
-                    </span>
-                  ) : detectedSuccess ? (
-                    <span className="text-[11px] font-mono text-emerald-400 flex items-center gap-1">
-                      <Check className="w-3 h-3 text-emerald-400" /> Auto-fetched & pasted!
-                    </span>
-                  ) : null}
+              {/* CARD 1: Identity */}
+              <div className="p-3.5 sm:p-4 rounded-xl bg-zinc-950/80 border border-zinc-800 space-y-3">
+                <div className="text-[11px] font-mono font-bold uppercase tracking-wider text-zinc-400 flex items-center gap-1.5">
+                  <Globe className="w-3.5 h-3.5 text-blue-400" />
+                  <span>1. Server Address & Title</span>
                 </div>
-                <input
-                  type="text"
-                  value={displayName}
-                  onChange={e => setDisplayName(e.target.value)}
-                  placeholder="e.g. My Survival SMP or myserver"
-                  required
-                  className="w-full px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-lg text-xs font-mono text-white placeholder:text-zinc-600 focus:outline-none focus:border-white"
-                />
-                <p className="text-[11px] text-zinc-400 mt-1 font-mono">
-                  Custom profile title shown on switcher and cards. Auto-pasted from Aternos.
-                </p>
-              </div>
 
-              {/* Server Address Field */}
-              <div>
-                <div className="flex items-center justify-between mb-1.5">
-                  <label className="block text-xs font-mono font-bold text-zinc-200">
+                <div>
+                  <label className="block text-xs font-mono font-bold text-zinc-200 mb-1">
                     Server Address (Domain / IP)
                   </label>
-                  {detectedSuccess && (
-                    <span className="text-[10px] font-mono text-white bg-zinc-800 px-2 py-0.5 rounded border border-zinc-700">
-                      Auto-detected from Aternos
-                    </span>
-                  )}
+                  <div className="relative">
+                    <Server className="w-4 h-4 text-zinc-500 absolute left-3 top-3 pointer-events-none" />
+                    <input
+                      type="text"
+                      value={serverAddress}
+                      onChange={e => handleServerAddressChange(e.target.value)}
+                      placeholder="e.g. myserver.aternos.me"
+                      required
+                      className="w-full pl-9 pr-3 py-2.5 bg-zinc-900 border border-zinc-700 rounded-xl text-sm font-mono text-white placeholder:text-zinc-600 focus:outline-none focus:border-white transition-colors"
+                    />
+                  </div>
+                  <p className="text-[11px] text-zinc-500 mt-1 font-mono">
+                    Your Aternos server address. If you type without .aternos.me, it will be added automatically.
+                  </p>
                 </div>
-                <div className="relative">
-                  <Server className="w-4 h-4 text-zinc-500 absolute left-3 top-2.5" />
+
+                <div>
+                  <label className="block text-xs font-mono font-bold text-zinc-200 mb-1">
+                    Display Name (Nickname)
+                  </label>
                   <input
                     type="text"
-                    value={serverAddress}
-                    onChange={e => handleServerAddressChange(e.target.value)}
-                    placeholder="e.g. server.aternos.me"
+                    value={displayName}
+                    onChange={e => setDisplayName(e.target.value)}
+                    placeholder="e.g. Survival SMP"
                     required
-                    className="w-full pl-9 pr-3 py-2 bg-zinc-900 border border-zinc-700 rounded-lg text-xs font-mono text-white placeholder:text-zinc-600 focus:outline-none focus:border-white"
+                    className="w-full px-3 py-2.5 bg-zinc-900 border border-zinc-700 rounded-xl text-sm font-mono text-white placeholder:text-zinc-600 focus:outline-none focus:border-white transition-colors"
                   />
                 </div>
-                <p className="text-[11px] text-zinc-400 mt-1 font-mono">
-                  Aternos server address. Auto-filled when entering session cookies below.
-                </p>
               </div>
 
-              {/* Error feedback if auto-fetch fails */}
-              {detectError && (
-                <div className="p-3 rounded-lg bg-red-950/40 border border-red-800/60 text-xs text-red-300 font-mono">
-                  {detectError}
-                </div>
-              )}
-
-              {/* Cookies with Auto-Detect */}
-              <div className="space-y-3 pt-1 border-t border-zinc-850">
-                <div>
-                  <div className="flex items-center justify-between mb-1">
-                    <label className="block text-xs font-mono text-zinc-300">
-                      ATERNOS_SESSION Cookie
-                    </label>
-                    <button
-                      type="button"
-                      onClick={() => handleAutoDetect()}
-                      disabled={isDetecting}
-                      className="text-[11px] font-mono text-zinc-300 hover:text-white flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-zinc-850 hover:bg-zinc-800 border border-zinc-700 cursor-pointer shadow-sm"
-                    >
-                      {isDetecting ? (
-                        <>
-                          <Loader2 className="w-3 h-3 animate-spin" />
-                          <span>Fetching details...</span>
-                        </>
-                      ) : (
-                        <>
-                          <Sparkles className="w-3 h-3 text-white" />
-                          <span>Auto-fetch Display Name & Address</span>
-                        </>
-                      )}
-                    </button>
+              {/* CARD 2: Aternos Session & Auto-Fetch */}
+              <div className="p-3.5 sm:p-4 rounded-xl bg-zinc-950/80 border border-zinc-800 space-y-3.5">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                  <div className="text-[11px] font-mono font-bold uppercase tracking-wider text-zinc-400 flex items-center gap-1.5">
+                    <Key className="w-3.5 h-3.5 text-amber-400" />
+                    <span>2. Aternos Session & Credentials</span>
                   </div>
+
+                  <button
+                    type="button"
+                    onClick={() => handleAutoDetect()}
+                    disabled={isDetecting}
+                    className="text-xs font-mono font-bold text-black bg-emerald-400 hover:bg-emerald-300 disabled:opacity-50 px-3 py-1.5 rounded-lg transition-all cursor-pointer flex items-center justify-center gap-1.5 shadow-sm active:scale-95"
+                  >
+                    {isDetecting ? (
+                      <>
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        <span>Fetching Aternos Specs...</span>
+                      </>
+                    ) : detectedSuccess ? (
+                      <>
+                        <Check className="w-3.5 h-3.5" />
+                        <span>Synced 1:1 from Aternos!</span>
+                      </>
+                    ) : (
+                      <>
+                        <Sparkles className="w-3.5 h-3.5" />
+                        <span>Auto-Fetch Specs</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+
+                {detectError && (
+                  <div className="p-3 rounded-xl bg-red-950/40 border border-red-800/60 text-xs text-red-300 font-mono flex items-start gap-2">
+                    <ShieldAlert className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+                    <span>{detectError}</span>
+                  </div>
+                )}
+
+                <div>
+                  <label className="block text-xs font-mono text-zinc-300 mb-1">
+                    ATERNOS_SESSION Cookie
+                  </label>
                   <textarea
                     rows={2}
                     value={sessionCookie}
                     onChange={e => handleSessionChange(e.target.value)}
-                    placeholder="Paste ATERNOS_SESSION cookie to auto-fill address..."
-                    className="w-full px-3 py-1.5 bg-zinc-900 border border-zinc-700 rounded-lg text-xs font-mono text-white placeholder:text-zinc-600 focus:outline-none focus:border-white break-all"
+                    placeholder="Paste ATERNOS_SESSION cookie or entire cookie header here..."
+                    className="w-full px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-xl text-xs font-mono text-white placeholder:text-zinc-600 focus:outline-none focus:border-white break-all transition-colors"
                   />
+                  <p className="text-[11px] text-zinc-500 mt-1 font-mono">
+                    Found in Browser DevTools (F12) → Application → Cookies → aternos.org → ATERNOS_SESSION
+                  </p>
                 </div>
 
-                {/* Discovered Servers on this account */}
+                <div>
+                  <label className="block text-xs font-mono text-zinc-300 mb-1">
+                    ATERNOS_SERVER Cookie (Server ID)
+                  </label>
+                  <input
+                    type="text"
+                    value={serverCookie}
+                    onChange={e => handleServerCookieChange(e.target.value)}
+                    placeholder="e.g. C97GPgj1GU2y7wWc or ATobOAQ3Dq2guih6"
+                    className="w-full px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-xl text-xs font-mono text-white placeholder:text-zinc-600 focus:outline-none focus:border-white transition-colors"
+                  />
+                  <p className="text-[11px] text-zinc-500 mt-1 font-mono">
+                    Unique per server on multi-server accounts. Auto-filled when clicking Auto-Fetch!
+                  </p>
+                </div>
+
+                {/* Discovered Servers Pills on Multi-Server Accounts */}
                 {discoveredServers.length > 0 && (
-                  <div className="p-3 rounded-lg bg-zinc-950 border border-zinc-800">
-                    <div className="text-[11px] font-mono font-bold text-zinc-300 mb-1.5 flex items-center justify-between">
-                      <span>Discovered Servers on Account ({discoveredServers.length}):</span>
-                      <span className="text-[10px] text-zinc-400 font-normal">Click to select</span>
+                  <div className="p-3 rounded-xl bg-zinc-900/90 border border-emerald-500/30 space-y-2">
+                    <div className="text-[11px] font-mono font-bold text-emerald-400 flex items-center justify-between">
+                      <span>Discovered Servers on this Account ({discoveredServers.length}):</span>
+                      <span className="text-[10px] text-zinc-400 font-normal">Tap to auto-select</span>
                     </div>
-                    <div className="flex flex-wrap gap-1.5">
+                    <div className="flex flex-wrap gap-2">
                       {discoveredServers.map(s => {
-                        const isSelected = serverCookie === s.serverCookie || serverAddress.toLowerCase() === s.serverAddress.toLowerCase();
+                        const isSelected =
+                          serverCookie === s.serverCookie ||
+                          serverAddress.toLowerCase() === s.serverAddress.toLowerCase();
                         return (
                           <button
                             key={s.id}
@@ -437,200 +484,279 @@ export const ManageServersModal: React.FC<ManageServersModalProps> = ({
                               setServerCookie(s.serverCookie);
                               setDetectedSuccess(true);
                             }}
-                            className={`px-2 py-1 rounded text-xs font-mono font-bold transition-all cursor-pointer border ${
+                            className={`px-3 py-1.5 rounded-lg text-xs font-mono font-bold transition-all cursor-pointer border flex items-center gap-1.5 ${
                               isSelected
-                                ? 'bg-white text-black border-white shadow-sm'
-                                : 'bg-zinc-900 text-zinc-300 border-zinc-700 hover:bg-zinc-800 hover:text-white'
+                                ? 'bg-white text-black border-white shadow-md'
+                                : 'bg-zinc-800 text-zinc-300 border-zinc-700 hover:bg-zinc-700 hover:text-white'
                             }`}
                           >
-                            {s.name}
+                            <Server className="w-3 h-3" />
+                            <span>{s.name}</span>
                           </button>
                         );
                       })}
                     </div>
                   </div>
                 )}
+              </div>
 
-                <div>
-                  <label className="block text-xs font-mono text-zinc-300 mb-1">
-                    ATERNOS_SERVER Cookie
-                  </label>
-                  <input
-                    type="text"
-                    value={serverCookie}
-                    onChange={e => handleServerCookieChange(e.target.value)}
-                    placeholder="e.g. ATobOAQ3Dq2guih6"
-                    className="w-full px-3 py-1.5 bg-zinc-900 border border-zinc-700 rounded-lg text-xs font-mono text-white placeholder:text-zinc-600 focus:outline-none focus:border-white"
-                  />
+              {/* CARD 3: Server Specs (Port, Software, Version) */}
+              <div className="p-3.5 sm:p-4 rounded-xl bg-zinc-950/80 border border-zinc-800 space-y-3">
+                <div className="text-[11px] font-mono font-bold uppercase tracking-wider text-zinc-400 flex items-center gap-1.5">
+                  <Wifi className="w-3.5 h-3.5 text-purple-400" />
+                  <span>3. Server Specs (Auto-Synced with Aternos)</span>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  <div>
+                    <label className="block text-xs font-mono text-zinc-300 mb-1">
+                      Server Port
+                    </label>
+                    <input
+                      type="text"
+                      value={serverPort}
+                      onChange={e => setServerPort(e.target.value)}
+                      placeholder="25565"
+                      className="w-full px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-xl text-xs font-mono text-white placeholder:text-zinc-600 focus:outline-none focus:border-white transition-colors"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-mono text-zinc-300 mb-1">
+                      Software
+                    </label>
+                    <select
+                      value={software}
+                      onChange={e => setSoftware(e.target.value)}
+                      className="w-full px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-xl text-xs font-mono text-white focus:outline-none focus:border-white cursor-pointer transition-colors"
+                    >
+                      {SOFTWARE_OPTIONS.map(opt => (
+                        <option key={opt} value={opt}>
+                          {opt}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-mono text-zinc-300 mb-1">
+                      Minecraft Version
+                    </label>
+                    <input
+                      type="text"
+                      value={version}
+                      onChange={e => setVersion(e.target.value)}
+                      placeholder="1.20.4"
+                      className="w-full px-3 py-2 bg-zinc-900 border border-zinc-700 rounded-xl text-xs font-mono text-white placeholder:text-zinc-600 focus:outline-none focus:border-white transition-colors"
+                    />
+                  </div>
                 </div>
               </div>
 
-              {/* Extra Properties */}
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-1 border-t border-zinc-850">
-                <div>
-                  <label className="block text-xs font-mono text-zinc-300 mb-1">
-                    Port
-                  </label>
-                  <input
-                    type="text"
-                    value={serverPort}
-                    onChange={e => setServerPort(e.target.value)}
-                    placeholder="25565"
-                    className="w-full px-3 py-1.5 bg-zinc-900 border border-zinc-700 rounded-lg text-xs font-mono text-white placeholder:text-zinc-600 focus:outline-none focus:border-white"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-xs font-mono text-zinc-300 mb-1">
-                    Software
-                  </label>
-                  <select
-                    value={software}
-                    onChange={e => setSoftware(e.target.value)}
-                    className="w-full px-3 py-1.5 bg-zinc-900 border border-zinc-700 rounded-lg text-xs font-mono text-white focus:outline-none focus:border-white cursor-pointer"
-                  >
-                    {SOFTWARE_OPTIONS.map(opt => (
-                      <option key={opt} value={opt}>
-                        {opt}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-
-                <div>
-                  <label className="block text-xs font-mono text-zinc-300 mb-1">
-                    Version
-                  </label>
-                  <input
-                    type="text"
-                    value={version}
-                    onChange={e => setVersion(e.target.value)}
-                    placeholder="1.20.4"
-                    className="w-full px-3 py-1.5 bg-zinc-900 border border-zinc-700 rounded-lg text-xs font-mono text-white placeholder:text-zinc-600 focus:outline-none focus:border-white"
-                  />
-                </div>
-              </div>
-
-              <div className="flex justify-end gap-2 pt-2">
+              {/* Form Action Buttons */}
+              <div className="flex items-center justify-end gap-2.5 pt-2">
                 <button
                   type="button"
                   onClick={() => {
                     setIsAddingNew(false);
                     setEditingId(null);
                   }}
-                  className="px-3 py-1.5 rounded-lg text-xs font-mono text-zinc-400 hover:text-white transition-colors cursor-pointer"
+                  className="px-4 py-2.5 rounded-xl text-xs font-mono font-medium text-zinc-400 hover:text-white hover:bg-zinc-800 transition-colors cursor-pointer"
                 >
                   Cancel
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-1.5 rounded-lg text-xs font-mono font-bold text-black bg-white hover:bg-zinc-200 transition-colors cursor-pointer shadow-sm"
+                  className="px-5 py-2.5 rounded-xl text-xs font-mono font-bold text-black bg-white hover:bg-zinc-200 transition-all cursor-pointer shadow-md active:scale-95 flex items-center gap-1.5"
                 >
-                  {isAddingNew ? 'Save Server' : 'Update Server'}
+                  <Check className="w-4 h-4" />
+                  <span>{isAddingNew ? 'Save Server' : 'Save Changes'}</span>
                 </button>
               </div>
             </form>
           ) : (
-            /* Server list */
-            <div className="space-y-2.5">
+            /* Server Profiles List */
+            <div className="space-y-3">
               {servers.map(server => {
                 const isActive = server.id === activeServerId;
-                const hasCookies = Boolean(server.sessionCookie && server.sessionCookie.trim());
+                const key = (server.serverIp || server.name || server.id).toLowerCase();
                 const profileState =
                   serverStates[server.id] ||
+                  serverStates[key] ||
                   serverStates[server.serverIp.toLowerCase()] ||
                   serverStates[server.name.toLowerCase()];
+
                 const status = profileState?.status || (server.status || 'offline');
                 const isOnline = status === 'online';
                 const isStarting = status === 'starting' || status === 'loading';
+                const isStopping = status === 'stopping';
+
+                const livePort = profileState?.serverPort || server.serverPort || '25565';
+                const liveSoftware = profileState?.software || server.software || 'Paper / Bukkit';
+                const liveVersion = profileState?.version || server.version || '1.20.4';
+                const playersOnline = profileState?.playersOnline ?? 0;
+                const maxPlayers = profileState?.maxPlayers ?? 20;
+                const hasPlayerList = Boolean(profileState?.playerList && profileState.playerList.length > 0);
 
                 return (
                   <div
                     key={server.id}
-                    className={`p-3.5 rounded-xl border transition-all flex flex-col sm:flex-row sm:items-center justify-between gap-3 ${
+                    className={`p-3.5 sm:p-4 rounded-2xl border transition-all flex flex-col gap-3 ${
                       isActive
-                        ? 'bg-zinc-950 border-zinc-500 shadow-md ring-1 ring-white/10'
-                        : 'bg-zinc-950/60 border-zinc-800 hover:border-zinc-700'
+                        ? 'bg-zinc-950 border-zinc-500 shadow-lg ring-1 ring-white/10'
+                        : 'bg-zinc-900 border-zinc-800 hover:border-zinc-700'
                     }`}
                   >
-                    <div className="space-y-1">
-                      <div className="flex items-center gap-2 flex-wrap">
-                        <span className="font-bold text-sm text-white font-mono">
+                    {/* Top Row: Name, Status Badge, Active Badge */}
+                    <div className="flex items-center justify-between gap-2 flex-wrap">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <div
+                          className={`w-2.5 h-2.5 rounded-full shrink-0 ${
+                            isOnline
+                              ? 'bg-emerald-400 animate-pulse'
+                              : isStarting
+                              ? 'bg-amber-400 animate-pulse'
+                              : isStopping
+                              ? 'bg-orange-400'
+                              : 'bg-zinc-600'
+                          }`}
+                        />
+                        <span className="font-bold text-sm sm:text-base text-white font-mono truncate">
                           {server.serverIp || server.name}
                         </span>
+                        {server.name && server.name !== server.serverIp && (
+                          <span className="text-xs text-zinc-400 font-mono truncate hidden sm:inline">
+                            ({server.name})
+                          </span>
+                        )}
+                      </div>
+
+                      <div className="flex items-center gap-1.5 shrink-0">
                         {isActive && (
-                          <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold uppercase bg-white text-black">
+                          <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold uppercase bg-white text-black shadow-sm">
                             ACTIVE
                           </span>
                         )}
                         <span
-                          className={`px-2 py-0.5 rounded text-[10px] font-mono font-bold uppercase ${
+                          className={`px-2 py-0.5 rounded text-[10px] font-mono font-bold uppercase border ${
                             isOnline
-                              ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
+                              ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
                               : isStarting
-                              ? 'bg-amber-500/20 text-amber-400 border border-amber-500/30'
-                              : 'bg-zinc-800 text-zinc-400 border border-zinc-750'
+                              ? 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+                              : isStopping
+                              ? 'bg-orange-500/15 text-orange-300 border-orange-500/30'
+                              : 'bg-zinc-800 text-zinc-400 border-zinc-750'
                           }`}
                         >
-                          {isOnline ? 'ONLINE' : isStarting ? 'STARTING' : 'OFFLINE'}
+                          {isOnline ? 'ONLINE' : isStarting ? 'STARTING' : isStopping ? 'STOPPING' : 'OFFLINE'}
                         </span>
-                        {!hasCookies && (
-                          <span className="text-[10px] font-mono text-zinc-500">
-                            (No cookies set)
+                      </div>
+                    </div>
+
+                    {/* Middle Row: Live Specs (Port, Software, Version, Players) */}
+                    <div className="flex flex-wrap items-center gap-2 text-xs font-mono text-zinc-400">
+                      <span className="px-2.5 py-1 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-300">
+                        Port: <strong className="text-white">{livePort}</strong>
+                      </span>
+                      <span className="px-2.5 py-1 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-300">
+                        {liveSoftware}
+                      </span>
+                      <span className="px-2.5 py-1 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-300">
+                        v{liveVersion}
+                      </span>
+
+                      {isOnline && (
+                        <span className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 font-semibold">
+                          <Users className="w-3 h-3" />
+                          <span>{playersOnline}/{maxPlayers} online</span>
+                        </span>
+                      )}
+
+                      {profileState?.countdownActive && profileState.countdownFormatted && (
+                        <span className="px-2.5 py-1 rounded-lg bg-blue-500/10 border border-blue-500/20 text-blue-400 font-bold">
+                          ⏳ {profileState.countdownFormatted}
+                        </span>
+                      )}
+                    </div>
+
+                    {/* Online Players Chips Preview */}
+                    {isOnline && hasPlayerList && (
+                      <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
+                        <span className="text-[11px] font-mono text-zinc-500">Players:</span>
+                        {profileState.playerList?.map(p => (
+                          <span
+                            key={p}
+                            className="text-[11px] font-mono font-semibold px-2 py-0.5 rounded bg-zinc-900 border border-emerald-500/30 text-emerald-300"
+                          >
+                            {p}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+
+                    {/* Bottom Action Row (Mobile Optimized Buttons) */}
+                    <div className="flex items-center justify-between gap-2 pt-2 border-t border-zinc-850">
+                      <div>
+                        {!isActive ? (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              onSelectServer(server.id);
+                              onClose();
+                            }}
+                            className="px-3.5 py-1.5 rounded-xl text-xs font-mono font-bold text-zinc-200 hover:text-white bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 transition-all cursor-pointer flex items-center gap-1.5 shadow-sm active:scale-95"
+                          >
+                            <span>Switch To Server</span>
+                            <ArrowRight className="w-3 h-3" />
+                          </button>
+                        ) : (
+                          <span className="text-xs font-mono text-emerald-400 flex items-center gap-1">
+                            <Check className="w-3.5 h-3.5" /> Currently Active
                           </span>
                         )}
                       </div>
 
-                      <div className="flex items-center gap-2 text-xs font-mono text-zinc-400">
-                        <span>Port {server.serverPort || '25565'}</span>
-                        <span aria-hidden="true">·</span>
-                        <span>{server.software} {server.version}</span>
-                      </div>
-                    </div>
-
-                    <div className="flex items-center gap-2 shrink-0">
-                      {!isActive && (
+                      <div className="flex items-center gap-2">
                         <button
-                          onClick={() => {
-                            onSelectServer(server.id);
-                            onClose();
-                          }}
-                          className="px-3 py-1.5 rounded-lg text-xs font-mono font-medium text-zinc-300 hover:text-white bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 transition-colors cursor-pointer"
+                          type="button"
+                          onClick={() => startEdit(server)}
+                          className="px-3 py-1.5 rounded-xl text-xs font-mono text-zinc-300 hover:text-white bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 hover:border-zinc-700 transition-colors cursor-pointer flex items-center gap-1.5"
+                          title="Edit server"
                         >
-                          Switch To
+                          <Edit2 className="w-3.5 h-3.5" />
+                          <span>Edit</span>
                         </button>
-                      )}
 
-                      <button
-                        onClick={() => startEdit(server)}
-                        className="p-1.5 rounded-lg text-zinc-400 hover:text-white hover:bg-zinc-800 transition-colors cursor-pointer"
-                        title="Edit server"
-                      >
-                        <Edit2 className="w-3.5 h-3.5" />
-                      </button>
-
-                      <button
-                        onClick={() => onDeleteServer(server.id)}
-                        className="p-1.5 rounded-lg text-zinc-500 hover:text-red-400 hover:bg-zinc-800 transition-colors cursor-pointer"
-                        title="Delete server profile"
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                      </button>
+                        <button
+                          type="button"
+                          onClick={() => onDeleteServer(server.id)}
+                          className="p-1.5 rounded-xl text-zinc-500 hover:text-red-400 hover:bg-red-500/10 transition-colors cursor-pointer"
+                          title="Delete server profile"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </div>
                     </div>
                   </div>
                 );
               })}
 
               {servers.length === 0 && (
-                <div className="text-center py-8 px-4 rounded-xl border border-dashed border-zinc-800 bg-zinc-950/40">
-                  <Server className="w-8 h-8 text-zinc-600 mx-auto mb-2" />
-                  <p className="text-sm font-bold text-white mb-1">No Server Profiles Yet</p>
-                  <p className="text-xs text-zinc-400 mb-4">Add your Aternos Minecraft server credentials to begin monitoring &amp; automation.</p>
+                <div className="text-center py-10 px-4 rounded-2xl border border-dashed border-zinc-800 bg-zinc-950/40 space-y-3">
+                  <div className="w-12 h-12 rounded-2xl bg-zinc-900 border border-zinc-800 flex items-center justify-center mx-auto text-zinc-500">
+                    <Server className="w-6 h-6" />
+                  </div>
+                  <div>
+                    <p className="text-sm font-bold text-white mb-1">No Server Profiles Configured</p>
+                    <p className="text-xs text-zinc-400 max-w-sm mx-auto">
+                      Add your Aternos Minecraft server credentials to begin monitoring &amp; continuous automation.
+                    </p>
+                  </div>
                   <button
                     onClick={startCreate}
-                    className="px-4 py-2 rounded-xl text-xs font-mono font-bold text-black bg-white hover:bg-zinc-200 transition-colors cursor-pointer inline-flex items-center gap-1.5"
+                    className="px-4 py-2.5 rounded-xl text-xs font-mono font-bold text-black bg-white hover:bg-zinc-200 transition-all cursor-pointer inline-flex items-center gap-1.5 shadow-md active:scale-95"
                   >
-                    <Plus className="w-3.5 h-3.5" />
+                    <Plus className="w-4 h-4" />
                     <span>Add Server Profile</span>
                   </button>
                 </div>
@@ -640,7 +766,7 @@ export const ManageServersModal: React.FC<ManageServersModalProps> = ({
         </div>
 
         {/* Footer */}
-        <div className="pt-3 border-t border-zinc-800 flex justify-end shrink-0">
+        <div className="px-4 py-3 sm:px-6 sm:py-3.5 border-t border-zinc-800 bg-zinc-900/95 flex justify-end shrink-0">
           <button
             onClick={onClose}
             className="px-4 py-2 rounded-xl text-xs font-mono text-zinc-300 hover:text-white transition-colors cursor-pointer"

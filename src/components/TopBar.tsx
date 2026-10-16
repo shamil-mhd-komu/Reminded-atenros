@@ -1,6 +1,6 @@
 import React, { useState, useRef } from 'react';
 import { motion } from 'motion/react';
-import { Server, Layers, Sparkles, ShieldCheck } from 'lucide-react';
+import { Server, Layers } from 'lucide-react';
 
 interface TopBarProps {
   onOpenSettings?: () => void;
@@ -77,17 +77,6 @@ export const TopBar: React.FC<TopBarProps> = ({
               <span className="text-sm sm:text-base font-extrabold tracking-tight text-white truncate font-sans">
                 Apexion
               </span>
-              <span className="hidden sm:inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-semibold font-mono rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-                <Sparkles className="w-2.5 h-2.5" /> 24/7 AFK
-              </span>
-              {isAdminLoggedIn && (
-                <span
-                  onClick={onOpenAdminPanel}
-                  className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-bold font-mono rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 cursor-pointer hover:bg-emerald-500/30 transition-colors"
-                >
-                  <ShieldCheck className="w-2.5 h-2.5" /> Admin
-                </span>
-              )}
             </div>
             <div className="flex items-center gap-1.5 text-xs text-zinc-400 truncate">
               <span className="truncate max-w-[140px] sm:max-w-[200px] text-zinc-300 font-medium">
@@ -103,21 +92,6 @@ export const TopBar: React.FC<TopBarProps> = ({
 
         {/* Action Buttons */}
         <div className="flex items-center gap-2 shrink-0">
-          {isAdminLoggedIn && (
-            <motion.button
-              whileHover={{ scale: 1.02 }}
-              whileTap={{ scale: 0.95 }}
-              onClick={() => {
-                if (onOpenAdminPanel) onOpenAdminPanel();
-              }}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-bold text-emerald-300 bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/30 transition-all cursor-pointer shadow-sm"
-              title="Open Admin Command Center"
-            >
-              <ShieldCheck className="w-3.5 h-3.5" />
-              <span>Admin Panel</span>
-            </motion.button>
-          )}
-
           {onOpenManageServers && (
             <motion.button
               whileHover={{ scale: 1.02 }}

@@ -31,11 +31,17 @@ async function startServer() {
     if (serverParam) {
       if (shouldRefresh) {
         aternosService.syncSessionState(serverParam).catch(() => {});
+      } else {
+        // Fast background sync if state is older than 2.5s
+        const currentState = aternosService.getState(serverParam);
+        if (!currentState.lastUpdated || Date.now() - currentState.lastUpdated > 2500) {
+          aternosService.syncSessionState(serverParam).catch(() => {});
+        }
       }
       const specificState = aternosService.getState(serverParam);
       res.json({
         ...specificState,
-        allServerStates: isAdmin ? aternosService.getAllStates() : { [serverParam]: specificState },
+        allServerStates: aternosService.getAllStates(),
       });
       return;
     }
@@ -47,7 +53,7 @@ async function startServer() {
     const activeState = aternosService.getState();
     res.json({
       ...activeState,
-      allServerStates: isAdmin ? aternosService.getAllStates() : {},
+      allServerStates: aternosService.getAllStates(),
     });
   });
 
@@ -134,6 +140,16 @@ async function startServer() {
     const { rules, serverAddress, serverId } = req.body || {};
     const target = (req.query.server as string) || serverAddress || serverId;
     const updated = aternosService.updateMacros(rules, target);
+    if (target && Array.isArray(rules)) {
+      const canonical = serverStorage.getCanonicalServerAddress(target);
+      const p = serverStorage.getProfile(canonical) || serverStorage.getProfile(target);
+      if (p) {
+        serverStorage.saveProfile({
+          ...p,
+          macros: updated,
+        });
+      }
+    }
     res.json(updated);
   });
 
@@ -370,6 +386,37 @@ async function startServer() {
       activeTarget: target,
       currentEnv: discordBot.getBotStatus().currentEnv,
       isBotRunning: discordBot.getBotStatus().isReady,
+    });
+  });
+
+  // Admin Discord bot token configuration & live reconnection
+  app.get('/api/admin/bot-config', verifyAdmin, (req, res) => {
+    res.json({
+      success: true,
+      ...discordBot.getBotStatus(),
+    });
+  });
+
+  app.post('/api/admin/bot-config', verifyAdmin, async (req, res) => {
+    const { token, clientId } = req.body || {};
+    if (!token || typeof token !== 'string' || token.trim().length === 0) {
+      res.status(400).json({ success: false, message: 'Discord bot token is required.' });
+      return;
+    }
+
+    const result = await discordBot.updateCredentials(token, clientId);
+    res.json({
+      ...result,
+      botStatus: discordBot.getBotStatus(),
+    });
+  });
+
+  // Admin Discord bot restart/reconnect
+  app.post('/api/admin/bot-restart', verifyAdmin, async (req, res) => {
+    const result = await discordBot.forceRestart();
+    res.json({
+      ...result,
+      botStatus: discordBot.getBotStatus(),
     });
   });
 

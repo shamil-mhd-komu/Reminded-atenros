@@ -102,14 +102,21 @@ export class AternosAutomationManager {
       this.getOrCreateSessionInstance(this.activeSessionKey, initialConfig);
     }
 
-    // Load saved multi-server profiles and macros
+    // Load saved multi-server profiles and macros from files and serverStorage
     this.loadServersConfig();
     this.loadMacrosConfig();
+    this.loadAllFromStorage();
 
-    // Background poll loop: every 12 seconds sync active sessions
+    // Live update when admin/discord changes any server profile or macros
+    serverStorage.onChange(() => {
+      this.loadAllFromStorage();
+    });
+
+    // Background poll loop: every 3.5 seconds sync active sessions and verify continuous guardian macros
     setInterval(() => {
+      this.loadAllFromStorage();
       this.syncActiveSession().catch(() => {});
-    }, 12000);
+    }, 3500);
 
     // Background countdown ticker
     setInterval(() => {
@@ -208,8 +215,104 @@ export class AternosAutomationManager {
     }
   }
 
+  /**
+   * Load and synchronize ALL persistent server profiles and Discord bindings from serverStorage.
+   * This ensures 24/7 background AFK Watchdog and Keepalive macros run seamlessly
+   * even when no users are visiting the website.
+   */
+  public loadAllFromStorage(): void {
+    try {
+      const allProfiles = serverStorage.getAllProfiles();
+      const allBindings = serverStorage.getAllDiscordBindings();
+
+      for (const p of allProfiles) {
+        const address = p.serverIp || p.name;
+        if (!address) continue;
+        const canonical = serverStorage.getCanonicalServerAddress(address);
+        const key = canonical.toLowerCase();
+        let inst = this.findSessionInstance(key) || this.sessions.get(key);
+
+        const cfg: SessionConfig = {
+          sessionCookie: p.sessionCookie || '',
+          serverCookie: p.serverCookie || '',
+          serverAddress: canonical,
+          software: p.software || 'Fabric',
+          version: p.version || '1.20.4',
+          serverPort: p.serverPort || '25565',
+        };
+
+        if (!inst) {
+          inst = this.getOrCreateSessionInstance(key, cfg);
+        } else {
+          if (p.sessionCookie && !p.sessionCookie.includes('...')) {
+            inst.config.sessionCookie = p.sessionCookie.trim();
+          }
+          inst.config.serverAddress = canonical;
+          inst.state.serverIp = canonical;
+
+          if (p.software) inst.state.software = p.software;
+          if (p.version) inst.state.version = p.version;
+          if (p.serverPort) inst.state.serverPort = p.serverPort;
+        }
+
+        if (p.id) inst.id = p.id;
+        if (Array.isArray(p.macros) && p.macros.length > 0) {
+          if (!inst.macros || inst.macros.length === 0) {
+            inst.macros = JSON.parse(JSON.stringify(p.macros));
+          } else {
+            // Merge macros: preserve enabled status if armed in either profile
+            inst.macros = inst.macros.map(m => {
+              const fromP = p.macros!.find((x: any) => x.id === m.id);
+              if (!fromP) return m;
+              // If incoming profile has macros, prioritize its enabled state and values
+              return {
+                ...m,
+                ...fromP,
+                // Ensure we don't wipe internal runtime state if we want to preserve it,
+                // but the 'enabled' flag MUST come from the profile (user intent)
+                enabled: fromP.enabled,
+              };
+            });
+          }
+        }
+        inst.state.sessionConnected = Boolean(inst.config.sessionCookie && inst.config.sessionCookie.trim().length > 0);
+      }
+
+      for (const b of allBindings) {
+        if (!b.serverAddress) continue;
+        const canonical = serverStorage.getCanonicalServerAddress(b.serverAddress);
+        const key = canonical.toLowerCase();
+        let inst = this.findSessionInstance(key) || this.sessions.get(key);
+
+        if (!inst) {
+          inst = this.getOrCreateSessionInstance(key, {
+            sessionCookie: b.sessionCookie || '',
+            serverCookie: b.serverCookie || '',
+            serverAddress: canonical,
+          });
+        } else {
+          if (b.sessionCookie && !b.sessionCookie.includes('...')) {
+            inst.config.sessionCookie = b.sessionCookie.trim();
+          }
+          if (b.serverCookie) {
+            inst.config.serverCookie = b.serverCookie.trim();
+          }
+          inst.config.serverAddress = canonical;
+          inst.state.serverIp = canonical;
+        }
+        inst.state.sessionConnected = Boolean(inst.config.sessionCookie && inst.config.sessionCookie.trim().length > 0);
+      }
+    } catch (err: any) {
+      console.warn('[Apexion] loadAllFromStorage notice:', err?.message);
+    }
+  }
+
   public getServersList(): any[] {
     try {
+      const storageProfiles = serverStorage.getAllProfiles();
+      if (storageProfiles.length > 0) {
+        return storageProfiles;
+      }
       if (fs.existsSync('./servers-config.json')) {
         const raw = fs.readFileSync('./servers-config.json', 'utf-8');
         const list = JSON.parse(raw);
@@ -287,7 +390,12 @@ export class AternosAutomationManager {
   private getOrCreateSessionInstance(key: string, config?: SessionConfig): ServerSessionInstance {
     const cleanKey = (key || 'default').toLowerCase();
     if (!this.sessions.has(cleanKey)) {
+      const stored = serverStorage.getProfile(cleanKey);
       const cfg = config || this.loadConfig();
+      const initialSoftware = cfg.software || stored?.software || 'Paper / Bukkit';
+      const initialVersion = cfg.version || stored?.version || '1.20.4';
+      const initialPort = cfg.serverPort || stored?.serverPort || '25565';
+
       const instance: ServerSessionInstance = {
         config: { ...cfg },
         isInitializing: false,
@@ -295,10 +403,10 @@ export class AternosAutomationManager {
         state: {
           status: 'offline',
           rawStatus: 'Offline',
-          serverIp: cfg.serverAddress || '',
-          serverPort: cfg.serverPort || '25565',
-          software: cfg.software || 'Paper / Bukkit',
-          version: cfg.version || '1.20.4',
+          serverIp: cfg.serverAddress || stored?.serverIp || '',
+          serverPort: initialPort,
+          software: initialSoftware,
+          version: initialVersion,
           queuePosition: null,
           queueEta: null,
           countdownSeconds: null,
@@ -412,9 +520,9 @@ export class AternosAutomationManager {
           inst.config.sessionCookie = cfg.sessionCookie.trim();
         }
         if (cfg.serverCookie) inst.config.serverCookie = cfg.serverCookie.trim();
-        inst.state.software = cfg.software || inst.state.software;
-        inst.state.version = cfg.version || inst.state.version;
-        inst.state.serverPort = cfg.serverPort || inst.state.serverPort;
+        if (cfg.software) inst.state.software = cfg.software;
+        if (cfg.version) inst.state.version = cfg.version;
+        if (cfg.serverPort) inst.state.serverPort = cfg.serverPort;
       }
       if (p.id) inst.id = p.id;
       if (p.macros && Array.isArray(p.macros) && p.macros.length > 0) {
@@ -485,8 +593,10 @@ export class AternosAutomationManager {
         }];
       }
 
-      // Fallback: Check known profiles in serverStorage
-      const profiles = serverStorage.getAllProfiles();
+      // Fallback: Check known profiles in serverStorage that match this exact session cookie
+      const profiles = serverStorage.getAllProfiles().filter((p: any) =>
+        p.sessionCookie && p.sessionCookie.trim() === cleanSession
+      );
       if (profiles.length > 0) {
         return profiles.map((p: any) => ({
           id: p.serverCookie || p.id,
@@ -524,6 +634,31 @@ export class AternosAutomationManager {
     };
   }
 
+  public cleanCookieValue(val?: string, keyName?: string): string {
+    if (!val || typeof val !== 'string') return '';
+    let cleaned = val.trim();
+    if (keyName) {
+      const reg = new RegExp(`^${keyName}=`, 'i');
+      cleaned = cleaned.replace(reg, '');
+    }
+    cleaned = cleaned.replace(/;.*$/, '').replace(/^["']|["']$/g, '').trim();
+    return cleaned;
+  }
+
+  public getCookiesForInstance(inst: ServerSessionInstance, secInfo?: { key: string; val: string }): string[] {
+    const session = this.cleanCookieValue(inst.config.sessionCookie, 'ATERNOS_SESSION');
+    const server = this.cleanCookieValue(inst.config.serverCookie, 'ATERNOS_SERVER');
+    const cf = this.cleanCookieValue(inst.config.cfClearanceCookie, 'cf_clearance');
+
+    const cookies: string[] = [];
+    if (session) cookies.push(`ATERNOS_SESSION=${session}`);
+    if (server) cookies.push(`ATERNOS_SERVER=${server}`);
+    if (cf) cookies.push(`cf_clearance=${cf}`);
+    if (secInfo) cookies.push(`ATERNOS_SEC_${secInfo.key}=${secInfo.val}`);
+
+    return cookies;
+  }
+
   // Execute stealth HTTP request using impersonated Chrome TLS fingerprint asynchronously without blocking event loop
   private async executeChromeRequest(url: string, cookies: string[], headers: Record<string, string> = {}): Promise<string> {
     const cookieStr = cookies.join('; ');
@@ -545,10 +680,18 @@ export class AternosAutomationManager {
     });
   }
 
-  // Extract AJAX_TOKEN from Aternos HTML
+  // Extract AJAX_TOKEN or headertoken from Aternos HTML
   private extractAjaxToken(html: string): string | null {
+    if (!html || typeof html !== 'string') return null;
+
+    // 0. Explicit headertoken or window.headertoken match
+    const headerTokenMatch = html.match(/(?:window\[['"]headertoken['"]\]|window\.headertoken|headertoken)\s*[:=]\s*['"]([^'"]+)['"]/i);
+    if (headerTokenMatch && headerTokenMatch[1] && headerTokenMatch[1].length >= 8) {
+      return headerTokenMatch[1];
+    }
+
     // 1. Direct assignment match
-    const tokenAssignmentMatch = html.match(/AJAX_TOKEN\]\s*=\s*([^;]+);/);
+    const tokenAssignmentMatch = html.match(/(?:AJAX_TOKEN\]|headertoken\])\s*=\s*([^;]+);/);
     if (tokenAssignmentMatch) {
       const expr = tokenAssignmentMatch[1];
       try {
@@ -570,7 +713,7 @@ export class AternosAutomationManager {
         sandbox.window.document.doctype.constructor = sandbox.window.DocumentType;
         vm.createContext(sandbox);
         const res = vm.runInContext(expr, sandbox, { timeout: 1500 });
-        if (res && typeof res === 'string' && res.length >= 10) {
+        if (res && typeof res === 'string' && res.length >= 8) {
           return res;
         }
       } catch {}
@@ -587,7 +730,7 @@ export class AternosAutomationManager {
     }
 
     // 3. Fallback: Direct assignment
-    const directMatch = html.match(/(?:window\[['"]AJAX_TOKEN['"]\]|AJAX_TOKEN)\s*=\s*['"]([^'"]+)['"]/);
+    const directMatch = html.match(/(?:window\[['"](?:AJAX_TOKEN|headertoken)['"]\]|AJAX_TOKEN|headertoken)\s*=\s*['"]([^'"]+)['"]/i);
     if (directMatch && directMatch[1]) {
       return directMatch[1];
     }
@@ -671,8 +814,36 @@ export class AternosAutomationManager {
 
   public applyLastStatus(inst: ServerSessionInstance, lastStatus: any) {
     if (!lastStatus) return;
+
+    // Validate that lastStatus genuinely matches inst, preventing cross-server status pollution
+    const normalize = (s: string) => s.toLowerCase().replace(/[-_\s]/g, '').replace(/\.aternos\.me$/i, '');
+    const instNorm = normalize(inst.config.serverAddress || inst.state.serverIp || '');
+    const statusNameNorm = lastStatus.name ? normalize(String(lastStatus.name)) : '';
+    const statusIpNorm = lastStatus.ip ? normalize(String(lastStatus.ip)) : '';
+    const statusId = lastStatus.id ? String(lastStatus.id).trim() : '';
+
+    const isMatch =
+      !instNorm ||
+      instNorm.includes('myserver') ||
+      instNorm === statusNameNorm ||
+      instNorm === statusIpNorm ||
+      (statusId && inst.config.serverCookie && statusId === inst.config.serverCookie) ||
+      (statusId && inst.id && statusId === inst.id);
+
+    if (!isMatch && (statusNameNorm || statusIpNorm || statusId)) {
+      // Cross-server response detected: Aternos served another server on this multi-server account.
+      // Forward status to the correct server instance WITHOUT modifying inst!
+      const targetQuery = lastStatus.ip || (lastStatus.name ? `${lastStatus.name}.aternos.me` : statusId);
+      const otherInst = this.findSessionInstance(targetQuery) || (statusId ? this.findSessionInstance(statusId) : undefined);
+      if (otherInst && otherInst !== inst) {
+        this.applyLastStatus(otherInst, lastStatus);
+      }
+      return;
+    }
+
     const code = Number(lastStatus.status);
     if (code === 1) {
+      inst.lastStartAttempt = 0;
       inst.state.status = 'online';
       inst.state.rawStatus = 'Online';
       inst.state.startVisible = false;
@@ -720,9 +891,12 @@ export class AternosAutomationManager {
       inst.state.stopVisible = false;
       inst.state.restartVisible = false;
       inst.state.extendVisible = false;
-    } else if (code === 0) {
+      inst.state.playerList = [];
+      inst.state.dynip = undefined;
+    } else {
+      // Fallback for any other codes (e.g. 7 = Crashed)
       inst.state.status = 'offline';
-      inst.state.rawStatus = 'Offline';
+      inst.state.rawStatus = lastStatus.label || 'Offline';
       inst.state.startVisible = true;
       inst.state.stopVisible = false;
       inst.state.restartVisible = false;
@@ -733,7 +907,6 @@ export class AternosAutomationManager {
       inst.state.canExtend = false;
       inst.state.playersOnline = 0;
       inst.state.playerList = [];
-      inst.state.dynip = undefined;
     }
 
     if (lastStatus.slots !== undefined) inst.state.maxPlayers = Number(lastStatus.slots);
@@ -754,23 +927,54 @@ export class AternosAutomationManager {
     if (lastStatus.version) inst.state.version = lastStatus.version;
     if (lastStatus.port) inst.state.serverPort = String(lastStatus.port);
     if (lastStatus.dynip) inst.state.dynip = lastStatus.dynip;
-    const rawAddr = (lastStatus.ip && typeof lastStatus.ip === 'string' && lastStatus.ip.trim())
-      ? lastStatus.ip.trim()
-      : (lastStatus.name && typeof lastStatus.name === 'string' && lastStatus.name.trim()
-        ? `${lastStatus.name.trim()}.aternos.me`
-        : (inst.config.serverAddress || inst.state.serverIp));
-    const canonicalAddr = serverStorage.getCanonicalServerAddress(rawAddr);
-    inst.state.serverIp = canonicalAddr;
-    inst.config.serverAddress = canonicalAddr;
+
+    if (!inst.config.serverAddress || inst.config.serverAddress.includes('myserver')) {
+      const rawAddr = (lastStatus.ip && typeof lastStatus.ip === 'string' && lastStatus.ip.trim())
+        ? lastStatus.ip.trim()
+        : (lastStatus.name && typeof lastStatus.name === 'string' && lastStatus.name.trim()
+          ? `${lastStatus.name.trim()}.aternos.me`
+          : (inst.config.serverAddress || inst.state.serverIp));
+      const canonicalAddr = serverStorage.getCanonicalServerAddress(rawAddr);
+      inst.state.serverIp = canonicalAddr;
+      inst.config.serverAddress = canonicalAddr;
+    }
     inst.state.lastUpdated = Date.now();
   }
 
-  public async syncSessionState(key: string): Promise<AternosState> {
-    const inst = this.findSessionInstance(key) || this.sessions.get(key);
+  public async syncSessionState(
+    key: string,
+    credentials?: { sessionCookie?: string; serverCookie?: string; serverAddress?: string; serverId?: string }
+  ): Promise<AternosState> {
+    let inst = this.findSessionInstance(key) || this.sessions.get(key.toLowerCase());
+    if (!inst && credentials?.serverAddress) {
+      const canonical = serverStorage.getCanonicalServerAddress(credentials.serverAddress);
+      inst = this.getOrCreateSessionInstance(canonical.toLowerCase(), {
+        sessionCookie: credentials.sessionCookie || '',
+        serverCookie: credentials.serverCookie || '',
+        serverAddress: canonical,
+      });
+    }
     if (!inst) return this.getState();
 
-    // Cache window: If updated less than 3.5 seconds ago, return cached state
-    if (Date.now() - inst.state.lastUpdated < 3500) {
+    // If explicit credentials passed, update instance immediately
+    if (credentials) {
+      if (credentials.sessionCookie && !credentials.sessionCookie.includes('...')) {
+        inst.config.sessionCookie = credentials.sessionCookie.trim();
+      }
+      if (credentials.serverCookie) {
+        inst.config.serverCookie = credentials.serverCookie.trim();
+      }
+      if (credentials.serverAddress) {
+        const canonical = serverStorage.getCanonicalServerAddress(credentials.serverAddress);
+        inst.config.serverAddress = canonical;
+        inst.state.serverIp = canonical;
+      }
+      if (credentials.serverId) inst.id = credentials.serverId;
+      inst.state.sessionConnected = Boolean(inst.config.sessionCookie);
+    }
+
+    // Cache window: If updated less than 1.2 seconds ago, return cached state
+    if (Date.now() - inst.state.lastUpdated < 1200) {
       return inst.state;
     }
 
@@ -782,28 +986,115 @@ export class AternosAutomationManager {
 
     const syncPromise = (async () => {
       try {
-        // Auto-resolve serverCookie if missing
-        if (!inst.config.serverCookie) {
-          const stored = serverStorage.getProfile(inst.config.serverAddress) || serverStorage.getProfile(key);
-          if (stored?.serverCookie) {
-            inst.config.serverCookie = stored.serverCookie;
+        // Auto-resolve serverCookie from storage or session discovery if missing
+        if (!inst.config.serverCookie || inst.config.serverCookie.trim().length === 0) {
+          const storedCookie = serverStorage.getServerCookie(inst.config.serverAddress) ||
+                               serverStorage.getProfile(inst.config.serverAddress)?.serverCookie ||
+                               serverStorage.getProfile(key)?.serverCookie;
+          if (storedCookie) {
+            inst.config.serverCookie = storedCookie;
+          } else if (inst.config.sessionCookie) {
+            const discovered = await this.discoverServersFromSession(inst.config.sessionCookie).catch(() => []);
+            const found = discovered.find(d => {
+              const dNorm = d.serverAddress.toLowerCase().replace(/[-_\s]/g, '');
+              const iNorm = (inst.config.serverAddress || key).toLowerCase().replace(/[-_\s]/g, '');
+              return dNorm === iNorm || dNorm.includes(iNorm) || iNorm.includes(dNorm);
+            });
+            if (found && found.serverCookie) {
+              inst.config.serverCookie = found.serverCookie;
+              serverStorage.setServerCookie(inst.config.serverAddress, found.serverCookie);
+            }
           }
         }
 
         // Query Aternos Server page directly via Chrome client
         if (inst.config.sessionCookie) {
           const secInfo = this.generateSecToken();
-          const cookies = [
-            `ATERNOS_SESSION=${inst.config.sessionCookie.trim()}`,
-            ...(inst.config.serverCookie ? [`ATERNOS_SERVER=${inst.config.serverCookie.trim()}`] : []),
-            `ATERNOS_SEC_${secInfo.key}=${secInfo.val}`,
-          ];
+          const cookies = this.getCookiesForInstance(inst, secInfo);
 
           const html = await this.executeChromeRequest('https://aternos.org/server/', cookies);
           const lastStatus = this.extractLastStatus(html);
 
           if (lastStatus) {
+            // Also extract software and version if missing from lastStatus object
+            if (!lastStatus.software) {
+              const swMatch = html.match(/class="[^"]*software[^"]*"[^>]*>([\s\S]*?)<\/div>/i) ||
+                              html.match(/software:[^<\n]*["']?([a-zA-Z0-9_\-\s/]+)/i);
+              if (swMatch && swMatch[1].trim()) lastStatus.software = swMatch[1].replace(/<[^>]+>/g, '').trim();
+            }
+            if (!lastStatus.version) {
+              const vMatch = html.match(/class="[^"]*version[^"]*"[^>]*>([\s\S]*?)<\/div>/i) ||
+                             html.match(/version:[^<\n]*["']?([0-9a-zA-Z._\-() ]+)/i);
+              if (vMatch && vMatch[1].trim()) lastStatus.version = vMatch[1].replace(/<[^>]+>/g, '').trim();
+            }
+            if (!lastStatus.port) {
+              const pMatch = html.match(/id="port"[^>]*>(\d+)<\/span>/i) ||
+                             html.match(/class="[^"]*port[^"]*"[^>]*>(\d+)<\/div>/i);
+              if (pMatch && pMatch[1].trim()) lastStatus.port = pMatch[1].trim();
+            }
             this.applyLastStatus(inst, lastStatus);
+
+            // AUTO-PERSIST: If we detected real software/version/port, save them to serverStorage
+            // This prevents the 'flicker' where background reload overwrites live data with stale defaults.
+            if (lastStatus.software || lastStatus.version || lastStatus.port) {
+              const profile = (inst.id ? serverStorage.getProfile(inst.id) : null) || serverStorage.getProfile(normKey);
+              if (profile) {
+                let changed = false;
+                if (lastStatus.software && lastStatus.software !== profile.software) {
+                  profile.software = lastStatus.software;
+                  changed = true;
+                }
+                if (lastStatus.version && lastStatus.version !== profile.version) {
+                  profile.version = lastStatus.version;
+                  changed = true;
+                }
+                if (lastStatus.port && String(lastStatus.port) !== profile.serverPort) {
+                  profile.serverPort = String(lastStatus.port);
+                  changed = true;
+                }
+                if (changed) {
+                  serverStorage.saveProfile(profile);
+                }
+              }
+            }
+          }
+        }
+
+        // Direct Minecraft SLP check for 100% verified online status and player names
+        if (inst.config.serverAddress && !inst.config.serverAddress.includes('myserver')) {
+          const mcLive = await this.checkMinecraftServerLive(inst.config.serverAddress);
+          if (mcLive) {
+            if (mcLive.online) {
+              inst.state.status = 'online';
+              inst.state.rawStatus = 'Online';
+              inst.state.startVisible = false;
+              inst.state.stopVisible = true;
+              inst.state.restartVisible = true;
+              inst.state.extendVisible = true;
+              if (mcLive.players) {
+                inst.state.playersOnline = mcLive.players.online;
+                inst.state.maxPlayers = mcLive.players.max;
+              }
+              if (mcLive.version && !inst.state.version) inst.state.version = mcLive.version;
+              if (mcLive.motd) inst.state.motd = mcLive.motd;
+            } else {
+              // Server is reported offline by Minecraft query
+              // CRITICAL: NEVER override to offline if Aternos itself reports the server online!
+              if (inst.state.status !== 'online' && inst.state.status !== 'starting' && inst.state.status !== 'queue') {
+                inst.state.status = 'offline';
+                inst.state.rawStatus = 'Offline';
+                inst.state.startVisible = true;
+                inst.state.stopVisible = false;
+                inst.state.restartVisible = false;
+                inst.state.extendVisible = false;
+                inst.state.countdownActive = false;
+                inst.state.countdownSeconds = null;
+                inst.state.countdownFormatted = null;
+                inst.state.canExtend = false;
+                inst.state.playersOnline = 0;
+                inst.state.playerList = [];
+              }
+            }
           }
         }
       } catch {
@@ -890,11 +1181,7 @@ export class AternosAutomationManager {
 
     try {
       const secInfo = this.generateSecToken();
-      const cookies = [
-        `ATERNOS_SESSION=${inst.config.sessionCookie.trim()}`,
-        ...(inst.config.serverCookie ? [`ATERNOS_SERVER=${inst.config.serverCookie.trim()}`] : []),
-        `ATERNOS_SEC_${secInfo.key}=${secInfo.val}`,
-      ];
+      const cookies = this.getCookiesForInstance(inst, secInfo);
 
       // Step 1: Fetch /server/ page to extract AJAX_TOKEN and inspect current live status
       this.addLog('SYS', `Fetching real Aternos tokens (SEC: ${secInfo.key})...`);
@@ -928,17 +1215,21 @@ export class AternosAutomationManager {
         throw new Error('Unable to extract AJAX_TOKEN from Aternos page. Please verify your session cookie in Session Auth.');
       }
 
+      const serverCookieClean = this.cleanCookieValue(inst.config.serverCookie, 'ATERNOS_SERVER');
+
       this.addLog('SYS', `AJAX_TOKEN unpacked (${token}). Dispatching Aternos /ajax/server/start...`);
 
       // Step 2: Send AJAX start request
       const startUrl = `https://aternos.org/ajax/server/start?headstart=false&access-credits=false&acceptEula=true&accept-eula=true&SEC=${encodeURIComponent(
         secInfo.sec
-      )}&TOKEN=${encodeURIComponent(token)}${inst.config.serverCookie ? `&SERVER=${encodeURIComponent(inst.config.serverCookie)}` : ''}`;
+      )}&TOKEN=${encodeURIComponent(token)}&headertoken=${encodeURIComponent(token)}${serverCookieClean ? `&SERVER=${encodeURIComponent(serverCookieClean)}` : ''}`;
 
       const rawRes = await this.executeChromeRequest(startUrl, cookies, {
         'X-Requested-With': 'XMLHttpRequest',
         'Accept': 'application/json, text/javascript, */*; q=0.01',
         'Referer': 'https://aternos.org/server/',
+        'headertoken': token,
+        'X-Headertoken': token,
       });
 
       let resData: any = null;
@@ -968,21 +1259,48 @@ export class AternosAutomationManager {
         this.addLog('INFO', `[SUCCESS] Aternos confirms server is already starting or online (${inst.config.serverAddress}).`);
         return { success: true, message: `Server is booting up or already online for ${inst.config.serverAddress}!` };
       } else {
-        const errorMsg = resData?.error || rawRes.substring(0, 100) || 'Aternos rejected the start request.';
-        if (errorMsg.includes('error occured') || errorMsg.includes('error occurred') || errorMsg.includes('An error occurred')) {
-          // Double check live status
-          const checkHtml = await this.executeChromeRequest('https://aternos.org/server/', cookies);
-          const checkStatus = this.extractLastStatus(checkHtml);
-          if (checkStatus) {
-            this.applyLastStatus(inst, checkStatus);
-            if (checkStatus.status === 1) {
-              return { success: true, message: `Server is already online (${checkStatus.dynip || inst.state.serverIp})` };
-            }
-            if (checkStatus.status === 2 || checkStatus.status === 6) {
-              return { success: true, message: `Server is currently starting (${checkStatus.label || 'Starting ...'})` };
-            }
+        // Double check live page status
+        this.addLog('SYS', `Start endpoint returned (${resData?.error || 'null/error'}). Re-verifying live status on Aternos...`);
+        const recheckHtml = await this.executeChromeRequest('https://aternos.org/server/', cookies).catch(() => '');
+        const checkStatus = this.extractLastStatus(recheckHtml);
+        if (checkStatus) {
+          this.applyLastStatus(inst, checkStatus);
+          if (checkStatus.status === 1) {
+            return { success: true, message: `Server is already online (${checkStatus.dynip || inst.state.serverIp})` };
+          }
+          if (checkStatus.status === 2 || checkStatus.status === 6) {
+            return { success: true, message: `Server is currently starting (${checkStatus.label || 'Starting ...'})` };
           }
         }
+
+        // Try confirm endpoint
+        const confirmUrl = `https://aternos.org/ajax/server/confirm?SEC=${encodeURIComponent(
+          secInfo.sec
+        )}&TOKEN=${encodeURIComponent(token)}&headertoken=${encodeURIComponent(token)}${serverCookieClean ? `&SERVER=${encodeURIComponent(serverCookieClean)}` : ''}`;
+
+        const confirmRes = await this.executeChromeRequest(confirmUrl, cookies, {
+          'X-Requested-With': 'XMLHttpRequest',
+          'Accept': 'application/json, text/javascript, */*; q=0.01',
+          'Referer': 'https://aternos.org/server/',
+          'headertoken': token,
+          'X-Headertoken': token,
+        }).catch(() => '');
+
+        let confirmData: any = null;
+        try { confirmData = JSON.parse(confirmRes); } catch {}
+
+        if (confirmData?.success === true) {
+          inst.lastStartAttempt = Date.now();
+          inst.state.status = 'starting';
+          inst.state.rawStatus = 'Starting ...';
+          inst.state.startVisible = false;
+          inst.state.stopVisible = true;
+          this.addLog('INFO', `[SUCCESS] Aternos start confirmed via confirm endpoint!`);
+          this.saveServersConfig();
+          return { success: true, message: `Server startup confirmed!` };
+        }
+
+        const errorMsg = resData?.error || confirmData?.error || (rawRes.includes('login') ? 'Aternos session expired or invalid. Please re-enter your session cookie.' : 'Aternos rejected the start request.');
         this.addLog('ERR', `Start rejected by Aternos: ${errorMsg}`);
         return { success: false, message: errorMsg };
       }
@@ -1023,22 +1341,21 @@ export class AternosAutomationManager {
 
     try {
       const secInfo = this.generateSecToken();
-      const cookies = [
-        `ATERNOS_SESSION=${inst.config.sessionCookie.trim()}`,
-        ...(inst.config.serverCookie ? [`ATERNOS_SERVER=${inst.config.serverCookie.trim()}`] : []),
-        `ATERNOS_SEC_${secInfo.key}=${secInfo.val}`,
-      ];
+      const cookies = this.getCookiesForInstance(inst, secInfo);
 
       const html = await this.executeChromeRequest('https://aternos.org/server/', cookies);
       const token = this.extractAjaxToken(html);
 
       const stopUrl = token
-        ? `https://aternos.org/ajax/server/stop?SEC=${encodeURIComponent(secInfo.sec)}&TOKEN=${encodeURIComponent(token)}${inst.config.serverCookie ? `&SERVER=${encodeURIComponent(inst.config.serverCookie)}` : ''}`
+        ? `https://aternos.org/ajax/server/stop?SEC=${encodeURIComponent(secInfo.sec)}&TOKEN=${encodeURIComponent(token)}&headertoken=${encodeURIComponent(token)}${inst.config.serverCookie ? `&SERVER=${encodeURIComponent(inst.config.serverCookie)}` : ''}`
         : `https://aternos.org/ajax/server/stop`;
 
       const rawRes = await this.executeChromeRequest(stopUrl, cookies, {
         'X-Requested-With': 'XMLHttpRequest',
+        'Accept': 'application/json, text/javascript, */*; q=0.01',
         'Referer': 'https://aternos.org/server/',
+        'headertoken': token || '',
+        'X-Headertoken': token || '',
       });
 
       let resData: any = null;
@@ -1100,22 +1417,21 @@ export class AternosAutomationManager {
 
     try {
       const secInfo = this.generateSecToken();
-      const cookies = [
-        `ATERNOS_SESSION=${inst.config.sessionCookie.trim()}`,
-        ...(inst.config.serverCookie ? [`ATERNOS_SERVER=${inst.config.serverCookie.trim()}`] : []),
-        `ATERNOS_SEC_${secInfo.key}=${secInfo.val}`,
-      ];
+      const cookies = this.getCookiesForInstance(inst, secInfo);
 
       const html = await this.executeChromeRequest('https://aternos.org/server/', cookies);
       const token = this.extractAjaxToken(html);
 
       const restartUrl = token
-        ? `https://aternos.org/ajax/server/restart?SEC=${encodeURIComponent(secInfo.sec)}&TOKEN=${encodeURIComponent(token)}${inst.config.serverCookie ? `&SERVER=${encodeURIComponent(inst.config.serverCookie)}` : ''}`
+        ? `https://aternos.org/ajax/server/restart?headstart=false&access-credits=false&acceptEula=true&accept-eula=true&SEC=${encodeURIComponent(secInfo.sec)}&TOKEN=${encodeURIComponent(token)}&headertoken=${encodeURIComponent(token)}${inst.config.serverCookie ? `&SERVER=${encodeURIComponent(inst.config.serverCookie)}` : ''}`
         : `https://aternos.org/ajax/server/restart`;
 
       const rawRes = await this.executeChromeRequest(restartUrl, cookies, {
         'X-Requested-With': 'XMLHttpRequest',
+        'Accept': 'application/json, text/javascript, */*; q=0.01',
         'Referer': 'https://aternos.org/server/',
+        'headertoken': token || '',
+        'X-Headertoken': token || '',
       });
 
       let resData: any = null;
@@ -1130,11 +1446,15 @@ export class AternosAutomationManager {
         this.addLog('INFO', `Restart command confirmed by Aternos for ${inst.config.serverAddress}.`);
         return { success: true, message: 'Restart triggered successfully.' };
       } else {
-        throw new Error(resData?.error || 'Aternos rejected restart command.');
+        // Fallback: If restart command fails, try startServer directly
+        this.addLog('WARN', `Restart endpoint returned error (${resData?.error || 'Bad request'}). Fallback to start sequence...`);
+        inst.state.isActionPending = false;
+        return await this.startServer(targetKey, credentials);
       }
     } catch (err: any) {
-      this.addLog('ERR', `Restart failed: ${err.message}`);
-      return { success: false, message: err.message };
+      this.addLog('ERR', `Restart failed (${err.message}). Attempting start fallback...`);
+      inst.state.isActionPending = false;
+      return await this.startServer(targetKey, credentials);
     } finally {
       inst.state.isActionPending = false;
       inst.state.currentAction = null;
@@ -1159,11 +1479,7 @@ export class AternosAutomationManager {
     this.addLog('CMD', `Adding keepalive timer for ${inst.config.serverAddress}...`);
     try {
       const secInfo = this.generateSecToken();
-      const cookies = [
-        `ATERNOS_SESSION=${inst.config.sessionCookie.trim()}`,
-        ...(inst.config.serverCookie ? [`ATERNOS_SERVER=${inst.config.serverCookie.trim()}`] : []),
-        `ATERNOS_SEC_${secInfo.key}=${secInfo.val}`,
-      ];
+      const cookies = this.getCookiesForInstance(inst, secInfo);
 
       const html = await this.executeChromeRequest('https://aternos.org/server/', cookies);
       const token = this.extractAjaxToken(html);
@@ -1171,13 +1487,15 @@ export class AternosAutomationManager {
       const extendUrl = token
         ? `https://aternos.org/ajax/server/extend-end?SEC=${encodeURIComponent(
             secInfo.sec
-          )}&TOKEN=${encodeURIComponent(token)}`
+          )}&TOKEN=${encodeURIComponent(token)}&headertoken=${encodeURIComponent(token)}${inst.config.serverCookie ? `&SERVER=${encodeURIComponent(inst.config.serverCookie)}` : ''}`
         : `https://aternos.org/ajax/server/extend-end`;
 
       const rawRes = await this.executeChromeRequest(extendUrl, cookies, {
         'X-Requested-With': 'XMLHttpRequest',
         'Accept': 'application/json, text/javascript, */*; q=0.01',
         'Referer': 'https://aternos.org/server/',
+        'headertoken': token || '',
+        'X-Headertoken': token || '',
       });
 
       let resData: any = null;
@@ -1245,14 +1563,55 @@ export class AternosAutomationManager {
         if (!matched) {
           matched = discovered[0];
         }
+        const storedProfile = serverStorage.getProfile(matched.serverAddress);
+        let detectedSoftware = storedProfile?.software || 'Fabric';
+        let detectedVersion = storedProfile?.version || '1.20.4';
+        let detectedPort = storedProfile?.serverPort || '25565';
+
+        // Query matched server's actual dashboard page to fetch live software, version, and port
+        if (cleanSession && matched.serverCookie) {
+          try {
+            const secInfo = this.generateSecToken();
+            const cookies = [
+              `ATERNOS_SESSION=${cleanSession}`,
+              `ATERNOS_SERVER=${matched.serverCookie}`,
+              `ATERNOS_SEC_${secInfo.key}=${secInfo.val}`,
+            ];
+            const html = await this.executeChromeRequest('https://aternos.org/server/', cookies).catch(() => '');
+            if (html) {
+              const lastStatus = this.extractLastStatus(html);
+              if (lastStatus) {
+                if (lastStatus.software) detectedSoftware = lastStatus.software;
+                if (lastStatus.version) detectedVersion = lastStatus.version;
+                if (lastStatus.port) detectedPort = String(lastStatus.port);
+              }
+              if (detectedSoftware === 'Paper / Bukkit') {
+                const swMatch = html.match(/class="[^"]*software[^"]*"[^>]*>([\s\S]*?)<\/div>/i) ||
+                                html.match(/software:[^<\n]*["']?([a-zA-Z0-9_\-\s/]+)/i);
+                if (swMatch && swMatch[1].trim()) detectedSoftware = swMatch[1].replace(/<[^>]+>/g, '').trim();
+              }
+              if (detectedVersion === '1.20.4') {
+                const vMatch = html.match(/class="[^"]*version[^"]*"[^>]*>([\s\S]*?)<\/div>/i) ||
+                               html.match(/version:[^<\n]*["']?([0-9a-zA-Z._\-() ]+)/i);
+                if (vMatch && vMatch[1].trim()) detectedVersion = vMatch[1].replace(/<[^>]+>/g, '').trim();
+              }
+              if (detectedPort === '25565') {
+                const pMatch = html.match(/id="port"[^>]*>(\d+)<\/span>/i) ||
+                               html.match(/class="[^"]*port[^"]*"[^>]*>(\d+)<\/div>/i);
+                if (pMatch && pMatch[1].trim()) detectedPort = pMatch[1].trim();
+              }
+            }
+          } catch {}
+        }
+
         return {
           success: true,
           displayName: matched.serverAddress,
           serverAddress: matched.serverAddress,
           serverCookie: matched.serverCookie,
-          software: 'Fabric',
-          version: '1.20.4',
-          serverPort: '25565',
+          software: detectedSoftware,
+          version: detectedVersion,
+          serverPort: detectedPort,
           message: `Discovered ${discovered.length} server${discovered.length > 1 ? 's' : ''} on your Aternos account: ${matched.serverAddress}`,
           allServers: discovered,
         };
@@ -1316,6 +1675,14 @@ export class AternosAutomationManager {
         if (!match) return existing;
         return { ...existing, ...match };
       });
+      // Persist macros directly to server profile so 24/7 AFK Watchdog runs even if website is closed
+      const p = serverStorage.getProfile(targetKey) || (inst.config.serverAddress ? serverStorage.getProfile(inst.config.serverAddress) : undefined);
+      if (p) {
+        serverStorage.saveProfile({
+          ...p,
+          macros: inst.macros,
+        });
+      }
       return inst.macros ? [...inst.macros] : [];
     }
 
@@ -1433,17 +1800,30 @@ export class AternosAutomationManager {
 
         // 1. 24/7 AFK Watchdog (Auto-Start if Offline / Crashed)
         if (macro.type === 'afk_watchdog') {
-          if (inst.state.status === 'offline') {
+          if (inst.state.status === 'offline' || inst.state.rawStatus.toLowerCase().includes('offline') || inst.state.rawStatus.toLowerCase().includes('crashed')) {
             if (inst.config.sessionCookie && inst.config.sessionCookie.trim().length > 10) {
               const lastAttempt = inst.lastStartAttempt || 0;
-              // Prevent rapid spam: wait at least 90s between watchdog auto-start attempts
-              if (now - lastAttempt > 90 * 1000) {
+              // Fast & resilient 15s check interval
+              if (now - lastAttempt > 15 * 1000) {
                 inst.lastStartAttempt = now;
                 macro.runCount++;
                 macro.lastRunTimestamp = now;
-                this.addLog('SYS', `[24/7 AFK Watchdog] Detected ${inst.config.serverAddress} is offline. Auto-initiating server start to maintain continuous 24/7 uptime...`);
-                await this.startServer(inst.config.serverAddress || key);
+                const target = inst.config.serverAddress || key;
+                this.addLog('SYS', `[24/7 AFK Watchdog] Detected ${target} is OFFLINE (${inst.state.rawStatus}). Auto-initiating server start...`);
+                
+                await this.syncSessionState(target).catch(() => {});
+                const res = await this.startServer(target);
+                if (!res.success) {
+                  // If start failed (e.g. server was still shutting down on Aternos side), allow quick retry in 10s
+                  inst.lastStartAttempt = now - 5 * 1000;
+                }
                 break;
+              }
+            } else {
+              // Log once why watchdog isn't running if it should be
+              if (!(inst as any)._watchdogWarned) {
+                this.addLog('WARN', `[Watchdog] Cannot start ${inst.config.serverAddress} - No valid session cookie found.`);
+                (inst as any)._watchdogWarned = true;
               }
             }
           }

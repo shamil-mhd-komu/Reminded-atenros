@@ -1,1 +1,212 @@
-[]
+[
+  {
+    "id": "discord-bang-bros-smp-aternos-me",
+    "name": "Bang_Bros_SMP.aternos.me",
+    "serverIp": "Bang_Bros_SMP.aternos.me",
+    "serverPort": "25565",
+    "software": "Fabric",
+    "version": "1.20.4",
+    "sessionCookie": "ycLA0GhkwmNdGUsIryOY7sqIoO41MJBarta1FBxvlRbbZW9MWi3rSoTRoQYHwYZRK02krNYlUlRCVBwREmHpj7GHRuHXstNzvIMd",
+    "serverCookie": "C97GPgj1GU2y7wWc",
+    "source": "discord",
+    "createdAt": 1791905776407,
+    "lastUpdated": 1792053107243,
+    "macros": [
+      {
+        "id": "macro-extend-interval",
+        "name": "Auto Add Timer (+1 Keepalive)",
+        "description": "When enabled, it will automatically click +1 when timer reaches below 1:00.",
+        "type": "extend_interval",
+        "enabled": true,
+        "lastRunTimestamp": null,
+        "nextRunTimestamp": null,
+        "runCount": 0
+      },
+      {
+        "id": "macro-afk-watchdog",
+        "name": "24/7 AFK Watchdog",
+        "description": "Automatically detects if the server is offline or crashed and restarts it to maintain 24/7 continuous uptime",
+        "type": "afk_watchdog",
+        "enabled": false,
+        "intervalMinutes": 1,
+        "lastRunTimestamp": null,
+        "nextRunTimestamp": null,
+        "runCount": 0
+      },
+      {
+        "id": "macro-restart-interval",
+        "name": "Interval Server Restart",
+        "description": "Automatically restart the server every X hours or minutes to prevent lag and refresh server state",
+        "type": "restart_interval",
+        "enabled": false,
+        "intervalMinutes": 60,
+        "lastRunTimestamp": null,
+        "nextRunTimestamp": null,
+        "runCount": 0
+      },
+      {
+        "id": "macro-restart-daily",
+        "name": "Daily Scheduled Restart",
+        "description": "Automatically restart the server everyday at a scheduled time (e.g. 06:30 AM)",
+        "type": "restart_daily",
+        "enabled": false,
+        "dailyTime": "06:30",
+        "lastRunTimestamp": null,
+        "nextRunTimestamp": null,
+        "runCount": 0
+      }
+    ],
+    "cfClearanceCookie": "",
+    "lastActive": 1792052587357,
+    "discordUser": "fliesh_yy4831"
+  },
+  {
+    "id": "srv-narendra-mundi-aternos-me",
+    "name": "Narendra_Mundi.aternos.me",
+    "serverIp": "Narendra_Mundi.aternos.me",
+    "serverPort": "25565",
+    "software": "Fabric",
+    "version": "1.20.4",
+    "sessionCookie": "ycLA0GhkwmNdGUsIryOY7sqIoO41MJBarta1FBxvlRbbZW9MWi3rSoTRoQYHwYZRK02krNYlUlRCVBwREmHpj7GHRuHXstNzvIMd",
+    "serverCookie": "ATobOAQ3Dq2guih6",
+    "source": "web",
+    "discordUser": "fliesh_yy4831",
+    "createdAt": 1792054911576,
+    "lastUpdated": 1792108316809,
+    "cfClearanceCookie": "",
+    "macros": [
+      {
+        "id": "macro-extend-interval",
+        "name": "Auto Add Timer (+1 Keepalive)",
+        "description": "When enabled, it will automatically click +1 when timer reaches below 1:00.",
+        "type": "extend_interval",
+        "enabled": false,
+        "lastRunTimestamp": null,
+        "nextRunTimestamp": null,
+        "runCount": 0
+      },
+      {
+        "id": "macro-afk-watchdog",
+        "name": "24/7 AFK Watchdog",
+        "description": "Automatically detects if the server is offline or crashed and restarts it to maintain 24/7 continuous uptime",
+        "type": "afk_watchdog",
+        "enabled": true,
+        "intervalMinutes": 1,
+        "lastRunTimestamp": null,
+        "nextRunTimestamp": null,
+        "runCount": 0
+      },
+      {
+        "id": "macro-restart-interval",
+        "name": "Interval Server Restart",
+        "description": "Automatically restart the server every X hours to refresh memory and clear lag",
+        "type": "restart_interval",
+        "enabled": false,
+        "intervalMinutes": 60,
+        "lastRunTimestamp": null,
+        "nextRunTimestamp": null,
+        "runCount": 0
+      },
+      {
+        "id": "macro-restart-daily",
+        "name": "Daily Schedule Restart",
+        "description": "Restart server everyday at a designated clock time (e.g. 06:30 AM)",
+        "type": "restart_daily",
+        "enabled": false,
+        "dailyTime": "06:30",
+        "lastRunTimestamp": null,
+        "nextRunTimestamp": null,
+        "runCount": 0
+      }
+    ],
+    "lastActive": 1792054363848
+  },
+  {
+    "id": "discord-joga63-aternos-me",
+    "name": "joga63.aternos.me",
+    "serverIp": "joga63.aternos.me",
+    "serverPort": "25565",
+    "software": "Fabric",
+    "version": "1.20.4",
+    "sessionCookie": "BLOQnqFru3Cusj62lcZLc2pEMlsrG3s2BG1LQ1ZSFBRDNMtFVCDmzkoHf67kuu4Zsivk5MLFjBIBwMqml3LFFSpK7bl7dhPbKqhd",
+    "serverCookie": "b3lnWOUjGd6624uG",
+    "source": "web",
+    "discordUser": "fliesh_yy4831",
+    "createdAt": 1791997386450,
+    "lastUpdated": 1792052256835,
+    "cfClearanceCookie": "",
+    "macros": [
+      {
+        "id": "macro-extend-interval",
+        "name": "Auto Add Timer (+1 Keepalive)",
+        "description": "When enabled, it will automatically click +1 when timer reaches below 1:00.",
+        "type": "extend_interval",
+        "enabled": true,
+        "lastRunTimestamp": null,
+        "nextRunTimestamp": null,
+        "runCount": 0
+      },
+      {
+        "id": "macro-afk-watchdog",
+        "name": "24/7 AFK Watchdog",
+        "description": "Automatically detects if the server is offline or crashed and restarts it to maintain 24/7 continuous uptime",
+        "type": "afk_watchdog",
+        "enabled": false,
+        "intervalMinutes": 1,
+        "lastRunTimestamp": null,
+        "nextRunTimestamp": null,
+        "runCount": 0
+      },
+      {
+        "id": "macro-restart-interval",
+        "name": "Interval Server Restart",
+        "description": "Automatically restart the server every X hours to refresh memory and clear lag",
+        "type": "restart_interval",
+        "enabled": false,
+        "intervalMinutes": 60,
+        "lastRunTimestamp": null,
+        "nextRunTimestamp": null,
+        "runCount": 0
+      },
+      {
+        "id": "macro-restart-daily",
+        "name": "Daily Schedule Restart",
+        "description": "Restart server everyday at a designated clock time (e.g. 06:30 AM)",
+        "type": "restart_daily",
+        "enabled": false,
+        "dailyTime": "06:30",
+        "lastRunTimestamp": null,
+        "nextRunTimestamp": null,
+        "runCount": 0
+      }
+    ],
+    "lastActive": 1791997766354
+  },
+  {
+    "id": "discord-nighah-aternos-me",
+    "name": "Nighah.aternos.me",
+    "serverIp": "Nighah.aternos.me",
+    "serverPort": "25565",
+    "software": "Paper / Bukkit",
+    "version": "1.20.4",
+    "sessionCookie": "BLOQnqFru3Cusj62lcZLc2pEMlsrG3s2BG1LQ1ZSFBRDNMtFVCDmzkoHf67kuu4Zsivk5MLFjBIBwMqml3LFFSpK7bl7dhPbKqhd",
+    "serverCookie": "h76d7YZ31NAOedyN",
+    "source": "discord",
+    "discordUser": "fliesh_yy4831",
+    "createdAt": 1791997774958,
+    "lastUpdated": 1792052257424
+  },
+  {
+    "id": "srv-realmc90-aternos-me",
+    "name": "Realmc90.aternos.me",
+    "serverIp": "Realmc90.aternos.me",
+    "serverPort": "17528",
+    "software": "Paper / Bukkit",
+    "version": "26.3",
+    "sessionCookie": "Crack",
+    "serverCookie": "",
+    "source": "web",
+    "createdAt": 1792027249054,
+    "lastUpdated": 1792053779532
+  }
+]

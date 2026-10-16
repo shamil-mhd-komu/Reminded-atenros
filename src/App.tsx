@@ -150,19 +150,28 @@ export default function App() {
 
   // Note: All user server profiles stay strictly in the Admin Panel and are never mixed with main manager servers
 
-  // Persist servers changes to user's localStorage (and backend if admin)
+  // Persist servers changes to user's localStorage and backend storage
   useEffect(() => {
     try {
       localStorage.setItem(STORAGE_SERVERS_KEY, JSON.stringify(servers));
-      if (adminToken && servers.length > 0) {
-        fetch('/api/servers/sync', {
+      if (servers.length > 0) {
+        // Synchronize with backend user profiles store
+        fetch('/api/user/sync', {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-admin-token': adminToken,
-          },
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ servers }),
         }).catch(() => {});
+
+        if (adminToken) {
+          fetch('/api/servers/sync', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'x-admin-token': adminToken,
+            },
+            body: JSON.stringify({ servers }),
+          }).catch(() => {});
+        }
       }
     } catch {}
   }, [servers, adminToken]);
@@ -228,7 +237,7 @@ export default function App() {
     }
   }, [activeServer?.id, syncServerWithBackend]);
 
-  // Poll Status & Logs every 2500ms when an active server exists
+  // Poll Status & Logs every 1500ms for instant 1:1 Aternos dashboard sync
   useEffect(() => {
     if (!activeServer) return;
 
@@ -245,12 +254,17 @@ export default function App() {
         if (statusRes.ok && isMounted) {
           const statusData: AternosState = await statusRes.json();
           setState(prev => {
+            const liveSoftware = statusData.software || activeServer.software || prev.software || 'Paper / Bukkit';
+            const liveVersion = statusData.version || activeServer.version || prev.version || '1.20.4';
+            const livePort = statusData.serverPort || activeServer.serverPort || prev.serverPort || '25565';
+
             if (statusData.status === 'offline' || statusData.status === 'stopping') {
               return {
                 ...statusData,
                 serverIp: activeServer.serverIp || statusData.serverIp,
-                software: activeServer.software || statusData.software,
-                version: activeServer.version || statusData.version,
+                software: liveSoftware,
+                version: liveVersion,
+                serverPort: livePort,
                 countdownActive: false,
                 countdownSeconds: null,
                 countdownFormatted: null,
@@ -260,8 +274,9 @@ export default function App() {
             return {
               ...statusData,
               serverIp: statusData.serverIp || activeServer.serverIp,
-              software: statusData.software || activeServer.software,
-              version: statusData.version || activeServer.version,
+              software: liveSoftware,
+              version: liveVersion,
+              serverPort: livePort,
               countdownSeconds: statusData.countdownSeconds !== null ? statusData.countdownSeconds : null,
             };
           });
@@ -271,13 +286,69 @@ export default function App() {
             setServerStates(prev => {
               const merged = { ...prev };
               for (const [k, s] of Object.entries(statusData.allServerStates as Record<string, AternosState>)) {
-                merged[k.toLowerCase()] = s;
+                const ex = merged[k.toLowerCase()];
+                const effSoftware = s.software || ex?.software || 'Paper / Bukkit';
+                const effVersion = s.version || ex?.version || '1.20.4';
+                const effPort = s.serverPort || ex?.serverPort || '25565';
+                merged[k.toLowerCase()] = {
+                  ...ex,
+                  ...s,
+                  software: effSoftware,
+                  version: effVersion,
+                  serverPort: effPort,
+                };
               }
-              merged[activeServer.id] = { ...statusData };
+              const activeEx = merged[activeServer.id] || merged[(activeServer.serverIp || '').toLowerCase()];
+              const effActiveSoftware = statusData.software || activeEx?.software || activeServer.software || 'Paper / Bukkit';
+              const effActiveVersion = statusData.version || activeEx?.version || activeServer.version || '1.20.4';
+              const effActivePort = statusData.serverPort || activeEx?.serverPort || activeServer.serverPort || '25565';
+
+              const activeMerged = {
+                ...activeEx,
+                ...statusData,
+                software: effActiveSoftware,
+                version: effActiveVersion,
+                serverPort: effActivePort,
+              };
+              merged[activeServer.id] = activeMerged;
               if (activeServer.serverIp) {
-                merged[activeServer.serverIp.toLowerCase()] = { ...statusData };
+                merged[activeServer.serverIp.toLowerCase()] = activeMerged;
               }
               return merged;
+            });
+
+            // Automatically synchronize live port, software, version from Aternos dashboard into servers profiles
+            setServers(prevServers => {
+              let changed = false;
+              const updated = prevServers.map(s => {
+                const key = (s.serverIp || s.name || s.id).toLowerCase();
+                const live = (statusData.allServerStates && (statusData.allServerStates[key] || statusData.allServerStates[s.id])) ||
+                             (key === (activeServer.serverIp || activeServer.id).toLowerCase() ? statusData : null);
+                if (!live) return s;
+
+                const newPort = live.serverPort || s.serverPort;
+                const newSoftware = live.software || s.software;
+                const newVersion = live.version || s.version;
+                const newStatus = live.status || s.status;
+
+                if (
+                  (newPort && newPort !== s.serverPort) ||
+                  (newSoftware && newSoftware !== s.software) ||
+                  (newVersion && newVersion !== s.version) ||
+                  (newStatus && newStatus !== s.status)
+                ) {
+                  changed = true;
+                  return {
+                    ...s,
+                    serverPort: newPort || s.serverPort,
+                    software: newSoftware || s.software,
+                    version: newVersion || s.version,
+                    status: newStatus || s.status,
+                  };
+                }
+                return s;
+              });
+              return changed ? updated : prevServers;
             });
           }
         }
@@ -294,7 +365,7 @@ export default function App() {
     };
 
     fetchSync();
-    const interval = setInterval(fetchSync, 2500);
+    const interval = setInterval(fetchSync, 1500);
 
     return () => {
       isMounted = false;

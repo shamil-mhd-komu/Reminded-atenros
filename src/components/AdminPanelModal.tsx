@@ -23,6 +23,7 @@ import {
   Terminal,
   Lock,
   Radio,
+  Key,
 } from 'lucide-react';
 import type { ServerProfile } from '../types/aternos.ts';
 
@@ -54,6 +55,11 @@ export const AdminPanelModal: React.FC<AdminPanelModalProps> = ({
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [isSwitchingBot, setIsSwitchingBot] = useState(false);
+  const [botTokenInput, setBotTokenInput] = useState('');
+  const [botClientIdInput, setBotClientIdInput] = useState('');
+  const [showBotToken, setShowBotToken] = useState(false);
+  const [isSavingBotToken, setIsSavingBotToken] = useState(false);
+  const [isRestartingBot, setIsRestartingBot] = useState(false);
 
   // Quick unlock password state if unauthorized
   const [isAuthLocked, setIsAuthLocked] = useState(false);
@@ -64,7 +70,7 @@ export const AdminPanelModal: React.FC<AdminPanelModalProps> = ({
   const [newServerAddress, setNewServerAddress] = useState('');
   const [newSessionCookie, setNewSessionCookie] = useState('');
   const [newServerCookie, setNewServerCookie] = useState('');
-  const [newSoftware, setNewSoftware] = useState('Paper / Bukkit');
+  const [newSoftware, setNewSoftware] = useState('Fabric');
   const [newVersion, setNewVersion] = useState('1.20.4');
 
   const getEffectiveToken = useCallback(() => {
@@ -277,6 +283,66 @@ export const AdminPanelModal: React.FC<AdminPanelModalProps> = ({
     }
   };
 
+  const handleSaveBotToken = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!botTokenInput.trim()) {
+      setMessage({ type: 'error', text: 'Please enter a valid Discord bot token.' });
+      return;
+    }
+    setIsSavingBotToken(true);
+    setMessage(null);
+    try {
+      const res = await fetch('/api/admin/bot-config', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-admin-token': getEffectiveToken(),
+        },
+        body: JSON.stringify({
+          token: botTokenInput.trim(),
+          clientId: botClientIdInput.trim(),
+        }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        setMessage({ type: 'success', text: data.message || 'Discord bot token updated and connected successfully!' });
+        setBotTokenInput('');
+        fetchAdminData();
+      } else {
+        setMessage({ type: 'error', text: data.message || 'Failed to connect bot with token.' });
+      }
+    } catch (err: any) {
+      setMessage({ type: 'error', text: err?.message || 'Network error while updating bot token.' });
+    } finally {
+      setIsSavingBotToken(false);
+    }
+  };
+
+  const handleRestartBot = async () => {
+    setIsRestartingBot(true);
+    setMessage(null);
+    try {
+      const res = await fetch('/api/admin/bot-restart', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-admin-token': getEffectiveToken(),
+        },
+      });
+      const data = await res.json();
+      if (data.success) {
+        setMessage({ type: 'success', text: data.message || 'Discord bot restarted successfully.' });
+        fetchAdminData();
+      } else {
+        setMessage({ type: 'error', text: data.message || 'Failed to restart bot.' });
+      }
+    } catch (err: any) {
+      setMessage({ type: 'error', text: err?.message || 'Network error restarting bot.' });
+    } finally {
+      setIsRestartingBot(false);
+    }
+  };
+
   const filteredServers = (Array.isArray(servers) ? servers : []).filter(s => {
     if (!s) return false;
     const sIp = String(s.serverIp || s.name || '').toLowerCase();
@@ -296,17 +362,17 @@ export const AdminPanelModal: React.FC<AdminPanelModalProps> = ({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center p-2 sm:p-4 bg-black/80 backdrop-blur-md"
+      className="fixed inset-0 z-50 flex items-center justify-center p-2 sm:p-4 bg-black/85"
       onClick={e => {
         if (e.target === e.currentTarget) onClose();
       }}
     >
       <div
-        className="relative w-full max-w-5xl h-[88vh] min-h-[500px] max-h-[850px] bg-zinc-900 border border-emerald-500/40 rounded-2xl sm:rounded-3xl flex flex-col shadow-2xl shadow-emerald-950/40 overflow-hidden text-zinc-100"
+        className="relative w-full max-w-5xl h-[88vh] min-h-[500px] max-h-[850px] bg-zinc-900 border border-emerald-500/40 rounded-2xl sm:rounded-3xl flex flex-col shadow-2xl shadow-emerald-950/40 overflow-hidden text-zinc-100 transform-gpu"
         onClick={e => e.stopPropagation()}
       >
         {/* Top Header Bar */}
-        <div className="px-4 sm:px-6 py-3.5 border-b border-white/10 bg-zinc-950/70 flex items-center justify-between shrink-0">
+        <div className="px-4 sm:px-6 py-3.5 border-b border-white/10 bg-zinc-950 flex items-center justify-between shrink-0 z-10">
           <div className="flex items-center gap-3 min-w-0">
             <div className="w-9 h-9 sm:w-10 sm:h-10 rounded-xl sm:rounded-2xl bg-emerald-500/20 border border-emerald-500/40 flex items-center justify-center text-emerald-400 shrink-0">
               <Shield className="w-5 h-5" />
@@ -458,7 +524,7 @@ export const AdminPanelModal: React.FC<AdminPanelModalProps> = ({
         </div>
 
         {/* Tab Navigation */}
-        <div className="px-4 sm:px-6 py-2 border-b border-white/5 flex items-center gap-2 overflow-x-auto no-scrollbar shrink-0 bg-zinc-900/80">
+        <div className="px-4 sm:px-6 py-2 border-b border-white/5 flex items-center gap-2 overflow-x-auto no-scrollbar shrink-0 bg-zinc-900 z-10">
           <button
             onClick={() => setActiveTab('servers')}
             className={`px-3.5 py-1.5 rounded-xl text-xs font-bold whitespace-nowrap transition-all cursor-pointer flex items-center gap-1.5 ${
@@ -515,8 +581,8 @@ export const AdminPanelModal: React.FC<AdminPanelModalProps> = ({
           </div>
         )}
 
-        {/* Content Body */}
-        <div className="flex-1 overflow-y-auto p-4 sm:p-6 overflow-x-hidden">
+        {/* Content Body - min-h-0, overscroll-contain, and isolate eliminate Chrome scroll clipping */}
+        <div className="flex-1 min-h-0 overflow-y-auto p-4 sm:p-6 overflow-x-hidden overscroll-contain transform-gpu isolate">
           {/* Quick Password Unlock Prompt if token is missing/expired */}
           {isAuthLocked ? (
             <div className="max-w-md mx-auto py-8 text-center space-y-4">
@@ -613,7 +679,7 @@ export const AdminPanelModal: React.FC<AdminPanelModalProps> = ({
                     return (
                       <div
                         key={server.id}
-                        className="p-4 rounded-2xl bg-zinc-950/80 border border-white/10 hover:border-emerald-500/40 transition-all flex flex-col gap-3 overflow-hidden"
+                        className="p-4 rounded-2xl bg-zinc-900 border border-white/10 hover:border-emerald-500/40 transition-all flex flex-col gap-3"
                       >
                         {/* Header Details */}
                         <div className="flex flex-wrap items-center justify-between gap-2">
@@ -820,8 +886,129 @@ export const AdminPanelModal: React.FC<AdminPanelModalProps> = ({
               )}
             </div>
           ) : activeTab === 'discord' ? (
-            /* Discord Bot Switcher Tab */
+            /* Discord Bot Configuration & Switcher Tab */
             <div className="space-y-4">
+              {/* Bot Token Configuration Card */}
+              <div className="p-4 sm:p-5 rounded-2xl bg-zinc-950/90 border border-emerald-500/30 space-y-4 shadow-lg shadow-emerald-950/20">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <div>
+                    <h4 className="text-sm font-bold text-white uppercase tracking-wider flex items-center gap-2">
+                      <Key className="w-4 h-4 text-emerald-400" />
+                      Discord Bot Credentials (Live Update)
+                    </h4>
+                    <p className="text-xs text-zinc-400 mt-1">
+                      Set or update your Discord Bot Token dynamically below. You can update this anytime — even after publishing — without modifying code files!
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2 self-start sm:self-auto">
+                    <span
+                      className={`text-xs font-mono font-bold px-2.5 py-1 rounded-lg border flex items-center gap-1.5 ${
+                        botStatus?.isReady
+                          ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                          : botStatus?.configured
+                          ? 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+                          : 'bg-zinc-800 text-zinc-400 border-white/10'
+                      }`}
+                    >
+                      <span className={`w-2 h-2 rounded-full ${botStatus?.isReady ? 'bg-emerald-400 animate-pulse' : botStatus?.configured ? 'bg-amber-400' : 'bg-zinc-500'}`} />
+                      <span>{botStatus?.isReady ? 'ONLINE & READY' : botStatus?.configured ? 'TOKEN CONFIGURED' : 'NO TOKEN CONFIGURED'}</span>
+                    </span>
+                  </div>
+                </div>
+
+                {/* Current Active Token Status */}
+                {botStatus?.configured && (
+                  <div className="p-3 rounded-xl bg-zinc-900 border border-white/5 flex flex-wrap items-center justify-between gap-2 text-xs font-mono">
+                    <div className="flex items-center gap-2 text-zinc-300">
+                      <Lock className="w-3.5 h-3.5 text-emerald-400" />
+                      <span>Active Token:</span>
+                      <span className="text-emerald-400 font-bold tracking-wider">{botStatus.maskedToken}</span>
+                    </div>
+                    <div className="flex items-center gap-2 text-zinc-400 text-[11px]">
+                      <span>Tag: <strong className="text-white">{botStatus.botTag || 'Apexion Bot'}</strong></span>
+                      <span>•</span>
+                      <span>Ping: <strong className="text-emerald-400">{botStatus.ping || 0}ms</strong></span>
+                    </div>
+                  </div>
+                )}
+
+                {/* Token Update Form */}
+                <form onSubmit={handleSaveBotToken} className="space-y-3 pt-1">
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    <div className="sm:col-span-2 space-y-1.5">
+                      <label className="text-[11px] font-bold uppercase tracking-wider text-zinc-300 flex items-center justify-between">
+                        <span>Bot Token</span>
+                        <span className="text-[10px] text-zinc-500 font-normal">Discord Developer Portal → Bot → Reset Token</span>
+                      </label>
+                      <div className="relative">
+                        <input
+                          type={showBotToken ? 'text' : 'password'}
+                          value={botTokenInput}
+                          onChange={e => setBotTokenInput(e.target.value)}
+                          placeholder={botStatus?.configured ? 'Enter new token to replace current token...' : 'Paste Discord bot token here (MTU1...)'}
+                          className="w-full px-3.5 py-2.5 pr-10 rounded-xl bg-zinc-900 border border-zinc-700 focus:border-emerald-500 text-xs text-white font-mono placeholder-zinc-500 outline-none transition-all"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => setShowBotToken(prev => !prev)}
+                          className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1 text-zinc-400 hover:text-white transition-colors cursor-pointer"
+                          title={showBotToken ? 'Hide token' : 'Show token'}
+                        >
+                          {showBotToken ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="space-y-1.5">
+                      <label className="text-[11px] font-bold uppercase tracking-wider text-zinc-300 flex items-center justify-between">
+                        <span>Client / App ID</span>
+                        <span className="text-[10px] text-zinc-500 font-normal">Optional</span>
+                      </label>
+                      <input
+                        type="text"
+                        value={botClientIdInput}
+                        onChange={e => setBotClientIdInput(e.target.value)}
+                        placeholder={botStatus?.clientId || '1555330856757755994'}
+                        className="w-full px-3.5 py-2.5 rounded-xl bg-zinc-900 border border-zinc-700 focus:border-emerald-500 text-xs text-white font-mono placeholder-zinc-500 outline-none transition-all"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+                    <p className="text-[11px] text-zinc-400 flex items-center gap-1.5">
+                      <Shield className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                      <span>Tokens are encrypted & securely stored in Redis/persistent storage.</span>
+                    </p>
+
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={handleRestartBot}
+                        disabled={isRestartingBot || isSavingBotToken}
+                        className="px-3.5 py-2 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-zinc-300 hover:text-white text-xs font-bold font-mono transition-all cursor-pointer flex items-center gap-1.5"
+                        title="Force Gateway Reconnect"
+                      >
+                        <RefreshCw className={`w-3.5 h-3.5 ${isRestartingBot ? 'animate-spin' : ''}`} />
+                        <span>{isRestartingBot ? 'Restarting...' : 'Restart Gateway'}</span>
+                      </button>
+
+                      <button
+                        type="submit"
+                        disabled={isSavingBotToken || !botTokenInput.trim()}
+                        className={`px-4 py-2 rounded-xl text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer ${
+                          !botTokenInput.trim() || isSavingBotToken
+                            ? 'bg-zinc-800 text-zinc-500 cursor-not-allowed opacity-60'
+                            : 'bg-emerald-500 hover:bg-emerald-400 text-zinc-950 shadow-md font-extrabold'
+                        }`}
+                      >
+                        <Check className="w-3.5 h-3.5" />
+                        <span>{isSavingBotToken ? 'Connecting...' : 'Save & Connect Bot'}</span>
+                      </button>
+                    </div>
+                  </div>
+                </form>
+              </div>
+
               <div className="p-4 sm:p-5 rounded-2xl bg-zinc-950/80 border border-indigo-500/30 space-y-4">
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                   <div>
